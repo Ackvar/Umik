@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>📈 График SPL</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root{
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #0b1220;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --border: rgba(255,255,255,.06);
+      --blue:#3b82f6;--green:#10b981;--red:#ef4444;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;background:
+        radial-gradient(1200px 600px at 20% -10%, rgba(34,211,238,.08), transparent),
+        radial-gradient(900px 500px at 120% 10%, rgba(99,102,241,.08), transparent),
+        var(--bg);
+      color:var(--text);
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial;
+    }
+    .container{max-width:1200px;margin:24px auto 56px;padding:0 16px}
+    .page-title{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:.2px;font-size:clamp(22px,2.6vw,32px);margin:8px 0 6px}
+    .subtitle{color:var(--muted);font-size:14px;margin:0 0 18px}
+    .tabs{display:flex;gap:8px;margin-bottom:14px}
+    .tab{
+      color:var(--text);text-decoration:none;font-size:14px;padding:8px 12px;border-radius:999px;
+      border:1px solid var(--border);background:rgba(255,255,255,.03)
+    }
+    .tab.active{outline:2px solid rgba(34,211,238,.35)}
+    .card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--border);
+      border-radius:18px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.03)}
+    .legend{display:flex;flex-wrap:wrap;gap:10px;margin:6px 0 14px}
+    .chip{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);
+      background:rgba(255,255,255,.03);padding:6px 10px;border-radius:999px;font-size:12px;cursor:pointer;user-select:none;opacity:.55}
+    .chip.active{opacity:1;box-shadow:0 0 0 2px rgba(255,255,255,.04) inset, 0 0 0 2px rgba(34,211,238,.28)}
+    .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+    canvas{width:100% !important;height:520px !important;background:#0b0f1a;border:1px solid var(--border);border-radius:14px;padding:8px}
+    .footer{margin-top:14px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+    .status-ok{color:#34d399}.status-bad{color:#f87171}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="page-title">📈 Уровни звука (SPL / Leq / Lmax)</div>
+    <div class="subtitle">Реальное время, обновление каждые 5 с • фильтры работают без перерисовки и мигания</div>
+
+    <!-- Нав-«вкладки» в стиле твоего UI -->
+    <nav class="tabs">
+      <a class="tab" href="/table">Таблица</a>
+      <a class="tab active" href="/chart">График SPL</a>
+      <a class="tab" href="/octave">Октавный анализ</a>
+      <a class="tab" href="/rta">RTA</a>
+      <a class="tab" href="/filtr">Фильтры</a>
+    </nav>
+
+    <div class="card">
+      <!-- Визуальные фильтры (вкл/выкл серий) -->
+      <div class="legend" id="legend">
+        <span class="chip active" data-key="spl"><span class="dot" style="background:var(--blue)"></span>SPL</span>
+        <span class="chip active" data-key="leq"><span class="dot" style="background:var(--green)"></span>Leq_1s</span>
+        <span class="chip active" data-key="lmax"><span class="dot" style="background:var(--red)"></span>Lmax</span>
+      </div>
+
+      <canvas id="splChart"></canvas>
+
+      <div class="footer">
+        <span id="updateStatus">Статус: ожидаю данные…</span>
+        <span>Диапазон: 40–120 дБ SPL</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const ctx = document.getElementById('splChart').getContext('2d');
+
+    // Градиенты
+    const g = (hex)=>{const gr=ctx.createLinearGradient(0,0,0,400);gr.addColorStop(0,hex.replace(')',',.35)'));gr.addColorStop(1,hex.replace(')',',.08)'));return gr}
+    const gradBlue = g('rgba(59,130,246)');
+    const gradGreen = g('rgba(16,185,129)');
+    const gradRed   = g('rgba(239,68,68)');
+
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label:'SPL',  borderColor:'#3b82f6', backgroundColor:gradBlue, data:[], tension:.3, pointRadius:2.5, pointHoverRadius:4, fill:true, hidden:false, key:'spl'  },
+          { label:'Leq_1s',borderColor:'#10b981', backgroundColor:gradGreen,data:[], tension:.3, pointRadius:2.5, pointHoverRadius:4, fill:true, hidden:false, key:'leq'  },
+          { label:'Lmax', borderColor:'#ef4444', backgroundColor:gradRed,  data:[], tension:.3, pointRadius:2.5, pointHoverRadius:4, fill:true, hidden:false, key:'lmax' }
+        ]
+      },
+      options: {
+        responsive:true, maintainAspectRatio:false,
+        interaction:{mode:'index',intersect:false},
+        plugins:{
+          title:{display:true,text:'📈 Уровни звука по времени (дБ SPL)',color:'#e5e7eb',font:{weight:'700',size:16},padding:{top:4,bottom:10}},
+          legend:{display:false},
+          tooltip:{
+            backgroundColor:'rgba(17,24,39,.96)',borderColor:'rgba(255,255,255,.08)',borderWidth:1,
+            titleColor:'#e5e7eb',bodyColor:'#e5e7eb',
+            callbacks:{
+              label:(ctx)=>`${ctx.dataset.label}: ${Number(ctx.parsed.y).toFixed(1)} dB`,
+              title:(items)=>`Время: ${items[0].label}`
+            }
+          }
+        },
+        scales:{
+          x:{ticks:{color:'rgba(229,231,235,.9)',maxTicksLimit:10},grid:{color:'rgba(255,255,255,.06)'},
+             title:{display:true,text:'Время',color:'#e5e7eb',padding:6}},
+          y:{suggestedMin:40,suggestedMax:120,ticks:{color:'rgba(229,231,235,.9)'},
+             grid:{color:'rgba(255,255,255,.06)'},
+             title:{display:true,text:'Звуковое давление (дБ SPL)',color:'#e5e7eb',padding:6}}
+        }
+      }
+    });
+
+    // --- Фильтры (чипы) ---
+    document.getElementById('legend').addEventListener('click', (e)=>{
+      const chip = e.target.closest('.chip'); if(!chip) return;
+      const key = chip.dataset.key;
+      const ds = chart.data.datasets.find(d=>d.key===key);
+      ds.hidden = !ds.hidden;
+      chip.classList.toggle('active', !ds.hidden);
+      chart.update('none'); // без анимации и мигания
+    });
+
+    // --- Обновление данных без «мигания» ---
+    const statusEl = document.getElementById('updateStatus');
+    let lastLabel = null; // последнее время на графике
+    let maxPoints = 600;  // ограничим хвост (напр., 50 минут при 5с)
+
+    function appendPoint(label, vSpl, vLeq, vLmax){
+      // добавляем синхронно во все массивы
+      chart.data.labels.push(label);
+      chart.data.datasets[0].data.push(vSpl);
+      chart.data.datasets[1].data.push(vLeq);
+      chart.data.datasets[2].data.push(vLmax);
+      // подрезаем хвост, чтобы график не раздувался
+      if(chart.data.labels.length>maxPoints){
+        chart.data.labels.shift();
+        chart.data.datasets.forEach(d=>d.data.shift());
+      }
+    }
+
+    async function updateChart(){
+      try{
+        statusEl.textContent = 'Статус: получаю данные…';
+        const res = await fetch('/api/latest', { cache:'no-store' });
+        if(!res.ok) throw new Error('HTTP '+res.status);
+        const data = await res.json();
+
+        const ts = (data.timestamps||[]).map(t=>new Date(t).toLocaleTimeString());
+        const spl = data.spl  || [];
+        const leq = data.leq  || [];
+        const lmx = data.lmax || [];
+
+        if(ts.length===0){ statusEl.innerHTML='Статус: <span class="status-bad">нет данных</span>'; return; }
+
+        // Если график пустой или сервер дал «новое окно» — мягкая инициализация (без мерцания)
+        if(chart.data.labels.length===0 || ts[0] > ts[ts.length-1]){
+          chart.data.labels = ts.slice(-maxPoints);
+          chart.data.datasets[0].data = spl.slice(-maxPoints);
+          chart.data.datasets[1].data = leq.slice(-maxPoints);
+          chart.data.datasets[2].data = lmx.slice(-maxPoints);
+          lastLabel = chart.data.labels.at(-1);
+          chart.update('none');
+          statusEl.innerHTML='Статус: <span class="status-ok">инициализировано</span>';
+          return;
+        }
+
+        // Инкрементально добавляем только новые точки
+        const lastFromServer = ts.at(-1);
+        if(lastLabel !== lastFromServer){
+          // найдём индекс первой новой метки
+          const idx = ts.lastIndexOf(lastLabel);
+          const start = (idx===-1) ? Math.max(0, ts.length-50) : idx+1; // добавим максимум 50 новых точек за раз
+          for(let i=start;i<ts.length;i++){
+            appendPoint(ts[i], spl[i], leq[i], lmx[i]);
+          }
+          lastLabel = lastFromServer;
+          chart.update('none');
+        }
+        statusEl.innerHTML='Статус: <span class="status-ok">обновлено</span>';
+      }catch(err){
+        console.error(err);
+        statusEl.innerHTML='Статус: <span class="status-bad">ошибка загрузки</span>';
+      }
+    }
+
+    // старт и таймер
+    updateChart();
+    setInterval(updateChart, 5000);
+  </script>
+</body>
+</html>

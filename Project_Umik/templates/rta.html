@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>🔊 Real-Time Spectrum (FFT)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root{
+      --bg:#0f172a; --panel:#111827; --panel-2:#0b1220;
+      --text:#e5e7eb; --muted:#9ca3af; --border:rgba(255,255,255,.06);
+      --accent:#22d3ee; --blue:#3b82f6;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      background:
+        radial-gradient(1200px 600px at 20% -10%, rgba(34,211,238,.08), transparent),
+        radial-gradient(900px 500px at 120% 10%, rgba(99,102,241,.08), transparent),
+        var(--bg);
+      color:var(--text);
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial;
+    }
+    .container{max-width:1200px;margin:24px auto 56px;padding:0 16px}
+    .page-title{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:.2px;font-size:clamp(22px,2.6vw,32px);margin:8px 0 6px}
+    .subtitle{color:var(--muted);font-size:14px;margin:0 0 16px}
+    .tabs{display:flex;gap:8px;margin-bottom:14px}
+    .tab{color:var(--text);text-decoration:none;font-size:14px;padding:8px 12px;border-radius:999px;border:1px solid var(--border);background:rgba(255,255,255,.03)}
+    .tab.active{outline:2px solid rgba(34,211,238,.35)}
+    .card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.03)}
+    .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+    .btn{
+      padding:8px 12px;border-radius:999px;border:1px solid var(--border);
+      background:rgba(255,255,255,.04);color:var(--text);font-size:13px;cursor:pointer;
+    }
+    .btn:hover{outline:2px solid rgba(34,211,238,.25)}
+    .switch{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+    .switch input{accent-color:#22d3ee;width:18px;height:18px}
+    .live{display:inline-flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+    .dot{width:8px;height:8px;border-radius:50%;background:#ef4444;box-shadow:0 0 10px #ef4444}
+    .dot.paused{background:#6b7280;box-shadow:none}
+    .canvas-wrap{width:100%;height:520px}
+    canvas{width:100% !important;height:100% !important;background:#0b0f1a;border:1px solid var(--border);border-radius:14px;padding:8px}
+    .status{margin-top:10px;font-size:12px;color:var(--muted)}
+    .status-ok{color:#34d399}.status-bad{color:#f87171}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="page-title">🔉 Real-Time Spectrum (FFT)</div>
+    <div class="subtitle">Анализ частот от 0 до 20 кГц • обновление каждую секунду • тёмная тема без мерцания</div>
+
+    <!-- Вкладки как на других страницах -->
+    <nav class="tabs">
+      <a class="tab" href="/table">Таблица</a>
+      <a class="tab" href="/chart">График SPL</a>
+      <a class="tab" href="/octave">Октавный анализ</a>
+      <a class="tab active" href="/rta">RTA</a>
+      <a class="tab" href="/filtr">Фильтры</a>
+    </nav>
+
+    <div class="card">
+      <div class="controls">
+        <button id="btnPause" class="btn">⏸ Пауза</button>
+        <label class="switch"><input id="chkAutoY" type="checkbox" checked>Авто-масштаб Y</label>
+        <label class="switch"><input id="chkSmoothing" type="checkbox" checked>Сглаживание линии</label>
+        <div class="live"><span id="liveDot" class="dot"></span><span id="liveText">LIVE</span></div>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="fftChart"></canvas>
+      </div>
+
+      <div id="status" class="status">Статус: ожидаю данные…</div>
+    </div>
+  </div>
+
+  <script>
+    const ctx = document.getElementById('fftChart').getContext('2d');
+
+    // Линия-градиент для приятного вида
+    const gradBlue = ctx.createLinearGradient(0,0,0,400);
+    gradBlue.addColorStop(0,'rgba(59,130,246,.35)');
+    gradBlue.addColorStop(1,'rgba(59,130,246,.08)');
+
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: { labels: [], datasets: [{
+        label: 'FFT (амплитуда)',
+        data: [],
+        borderColor: '#3b82f6',
+        backgroundColor: gradBlue,
+        pointRadius: 0,
+        borderWidth: 1,
+        tension: .25,
+        fill: true
+      }]},
+      options: {
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          title: {
+            display: true,
+            text: 'Анализ частот от 0 до 20 кГц (1 секунда)',
+            color: '#e5e7eb', font: { weight:'700', size:16 }, padding:{ top:4,bottom:10 }
+          },
+          tooltip: {
+            backgroundColor: 'rgba(17,24,39,.96)',
+            borderColor: 'rgba(255,255,255,.08)',
+            borderWidth: 1,
+            titleColor: '#e5e7eb',
+            bodyColor: '#e5e7eb',
+            callbacks: {
+              label: (c)=>`Амп: ${Number(c.parsed.y).toFixed(1)}`,
+              title: (items)=>`Частота: ${Number(items[0].label).toFixed(0)} Гц`
+            }
+          }
+        },
+        scales: {
+          x: {
+            type: 'linear',
+            min: 0, max: 20000,
+            ticks: { color:'rgba(229,231,235,.9)' },
+            grid: { color:'rgba(255,255,255,.06)' },
+            title: { display:true, text:'Частота (Гц)', color:'#e5e7eb', padding:6 }
+          },
+          y: {
+            ticks: { color:'rgba(229,231,235,.9)' },
+            grid: { color:'rgba(255,255,255,.06)' },
+            title: { display:true, text:'Амплитуда (норм.)', color:'#e5e7eb', padding:6 }
+          }
+        }
+      }
+    });
+
+    // --- Реал-тайм обновление без мигания ---
+    const statusEl = document.getElementById('status');
+    const btnPause = document.getElementById('btnPause');
+    const chkAutoY = document.getElementById('chkAutoY');
+    const chkSmoothing = document.getElementById('chkSmoothing');
+    const liveDot = document.getElementById('liveDot');
+
+    let paused = false;
+    let currentController = null; // AbortController для предотвращения наложения запросов
+
+    btnPause.addEventListener('click', ()=>{
+      paused = !paused;
+      btnPause.textContent = paused ? '▶️ Продолжить' : '⏸ Пауза';
+      liveDot.classList.toggle('paused', paused);
+    });
+
+    chkSmoothing.addEventListener('change', ()=>{
+      chart.data.datasets[0].tension = chkSmoothing.checked ? .25 : 0;
+      chart.update('none');
+    });
+
+    function applyAutoY(values){
+      if(!chkAutoY.checked) return;
+      let min = Infinity, max = -Infinity;
+      for(const v of values){ if(v<min) min=v; if(v>max) max=v; }
+      if(!isFinite(min) || !isFinite(max)) return;
+      if(min===max){ max = min + 1; min = Math.max(0, min - 1); }
+      chart.options.scales.y.min = Math.floor(min);
+      chart.options.scales.y.max = Math.ceil(max);
+    }
+
+    async function fetchFFT(){
+      if(paused) return;
+
+      // отменяем предыдущий, если ещё не завершился
+      try{ currentController?.abort(); }catch(_){}
+      currentController = new AbortController();
+
+      try{
+        statusEl.textContent = 'Статус: получаю данные…';
+        const res = await fetch('/api/fft', { cache:'no-store', signal: currentController.signal });
+        if(!res.ok) throw new Error('HTTP '+res.status);
+        const data = await res.json();
+
+        const freqs = data.freqs || [];
+        const vals  = data.values || [];
+
+        // обновляем данные без анимации
+        chart.data.labels = freqs;
+        chart.data.datasets[0].data = freqs.map((f,i)=>({x:f, y:vals[i] ?? 0}));
+
+        applyAutoY(vals);
+        chart.update('none');
+
+        statusEl.innerHTML = 'Статус: <span class="status-ok">обновлено</span>';
+      }catch(e){
+        if(e.name === 'AbortError') return; // нормальная отмена
+        console.error(e);
+        statusEl.innerHTML = 'Статус: <span class="status-bad">ошибка загрузки</span>';
+      }
+    }
+
+    // первый запуск и таймер «прослушивания»
+    fetchFFT();
+    setInterval(fetchFFT, 1000);
+  </script>
+</body>
+</html>

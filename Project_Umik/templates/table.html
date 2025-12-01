@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="refresh" content="5">
+  <title>📊 Sound Log Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root{
+      --bg:#0f172a; --panel:#111827; --panel-2:#0b1220;
+      --text:#e5e7eb; --muted:#9ca3af; --border:rgba(255,255,255,.06);
+      --accent:#22d3ee; --thead:#0c1323; --row:#0b0f1a;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      background:
+        radial-gradient(1200px 600px at 20% -10%, rgba(34,211,238,.08), transparent),
+        radial-gradient(900px 500px at 120% 10%, rgba(99,102,241,.08), transparent),
+        var(--bg);
+      color:var(--text);
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial;
+      padding: 24px 16px 56px;
+    }
+
+    .container{max-width:1200px;margin:0 auto}
+    .page-title{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:.2px;font-size:clamp(22px,2.6vw,32px);margin:6px 0 8px}
+    .subtitle{color:var(--muted);font-size:14px;margin:0 0 16px}
+
+    /* tabs */
+    .tabs{display:flex;gap:8px;margin:0 0 14px}
+    .tab{
+      color:var(--text);text-decoration:none;font-size:14px;padding:8px 12px;border-radius:999px;
+      border:1px solid var(--border);background:rgba(255,255,255,.03)
+    }
+    .tab.active{outline:2px solid rgba(34,211,238,.35)}
+
+    /* card */
+    .card{
+      background:linear-gradient(180deg,var(--panel),var(--panel-2));
+      border:1px solid var(--border);
+      border-radius:18px;
+      padding:18px;
+      box-shadow:0 10px 30px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.03)
+    }
+
+    /* legend text */
+    .legend{
+      color:var(--muted); font-size:14px; line-height:1.55; margin-bottom:14px;
+    }
+    .legend strong{ color:var(--text) }
+
+    /* table */
+    .table-wrap{
+      border:1px solid var(--border);
+      border-radius:14px;
+      overflow:auto;
+      background:#0b0f1a;
+    }
+    table{
+      border-collapse:separate; border-spacing:0; width:100%;
+      min-width: 900px;
+      font-size:14px;
+    }
+    thead th{
+      position:sticky; top:0; z-index:2;
+      background:linear-gradient(180deg,var(--thead),#0a1120);
+      color:#e6f0ff;
+      text-align:center;
+      padding:12px 10px;
+      border-bottom:1px solid var(--border);
+      font-weight:700;
+      white-space:nowrap;
+    }
+    tbody td{
+      text-align:center;
+      padding:10px 10px;
+      border-bottom:1px dashed rgba(255,255,255,.06);
+      color:var(--text);
+    }
+    tbody tr:nth-child(even){ background:rgba(255,255,255,.02) }
+    tbody tr:hover{ background:rgba(34,211,238,.06) }
+
+    /* rounded corners for sticky header table */
+    thead th:first-child{ border-top-left-radius:14px }
+    thead th:last-child{ border-top-right-radius:14px }
+
+    /* small screens */
+    @media (max-width: 768px){
+      body{ padding:16px 8px 40px }
+      .legend{ font-size:13px }
+      table{ font-size:12px; min-width:720px }
+      thead th, tbody td{ padding:8px }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="page-title">📊 Последние измерения звука</div>
+    <div class="subtitle">Автообновление каждые 5 с • тёмная тема в едином стиле</div>
+
+    <!-- Навигация -->
+    <nav class="tabs">
+      <a class="tab active" href="/">Таблица</a>
+      <a class="tab" href="/chart">График SPL</a>
+      <a class="tab" href="/octave">Октавный анализ</a>
+      <a class="tab" href="/rta">RTA</a>
+      <a class="tab" href="/filtr">Фильтры</a>
+    </nav>
+
+    <div class="card">
+      <div class="legend">
+        <strong>🔷 Обозначения:</strong><br>
+        <strong>timestamp</strong> — время замера<br>
+        <strong>SPL</strong> — текущий уровень звукового давления (дБ)<br>
+        <strong>Leq_1s</strong> — средний эквивалентный уровень за 1 секунду (дБ)<br>
+        <strong>Leq_60s</strong> — средний эквивалентный уровень за 60 секунд (дБ)<br>
+        <strong>Lmax</strong> — максимальный пиковый уровень за 1 секунду (дБ)<br>
+        <strong>31.5 Hz – 8000 Hz</strong> — уровни SPL в октавных полосах (дБ)
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              {% for col in columns %}
+                <th>{{ col }}</th>
+              {% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in rows %}
+              <tr>
+                {% for cell in row %}
+                  <td>{{ cell }}</td>
+                {% endfor %}
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

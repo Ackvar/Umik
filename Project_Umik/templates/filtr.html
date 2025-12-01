@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Фильтры и взвешивания — UMIK</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { --bg:#0f172a; --card:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#60a5fa; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji","Segoe UI Emoji"; background: var(--bg); color: var(--text); }
+    header { padding:16px 24px; border-bottom:1px solid #1f2937; display:flex; gap:16px; align-items:center; }
+    header a { color: var(--muted); text-decoration:none; padding:8px 10px; border-radius:10px; }
+    header a.active, header a:hover { color: var(--text); background:#1f2937; }
+    main { padding: 24px; max-width: 1100px; margin: 0 auto; display:grid; gap:16px; }
+    .card { background: var(--card); border:1px solid #1f2937; border-radius:16px; padding:18px; }
+    .grid { display:grid; gap:16px; grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); }
+    .muted { color: var(--muted); }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 0; border-bottom:1px dashed #223045; }
+    .row:last-child { border-bottom:none; }
+    .pill { padding:6px 10px; border-radius:999px; background:#1f2937; font-size:12px; color:var(--muted); }
+    .big { font-size:28px; font-weight:700; }
+    .btn { appearance:none; border:1px solid #334155; background:#0b1220; color:var(--text); padding:8px 12px; border-radius:10px; cursor:pointer; }
+    .btn:hover { border-color:#475569; }
+    .hint { font-size:12px; color:var(--muted); }
+    .badge { background:#0b3b6c; color:#cde6ff; padding:4px 8px; border-radius:8px; font-size:12px; }
+    .kv { display:flex; gap:8px; align-items:center; }
+    .kv b { font-size:14px; }
+    .mono { font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace; }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="/" >Таблица</a>
+    <a href="/chart">График SPL</a>
+    <a href="/octave">Октавный анализ</a>
+    <a href="/rta">RTA</a>
+    <a href="/filtr" class="active">Фильтры</a>
+  </header>
+
+  <main>
+    <section class="card">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+        <h2 style="margin:0;">Фильтры и взвешивания</h2>
+        <span class="pill mono">реальное устройство: UMIK-1 @ 48 kHz</span>
+      </div>
+      <p class="muted" style="margin-top:6px">
+        Здесь собраны подсказки и текущие значения для режимов <b>A-взвешивание</b>, <b>C-взвешивание</b>,
+        а также временная фильтрация <b>Fast</b>/<b>Slow</b> (экспоненциальное сглаживание) — всё это уже применяется в <span class="mono">main.py</span>.
+        Страница отображает последние измерения из базы и помогает быстро проверить, в каком режиме вы сейчас работаете.
+      </p>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <h3 style="margin:0 0 8px 0;">Взвешивания (частотные)</h3>
+        <div class="row"><div class="kv"><span class="badge">A-weighting</span><b>Имитация чувствительности человеческого слуха при средних уровнях</b></div></div>
+        <div class="row"><div class="kv"><span class="badge">C-weighting</span><b>Почти ровная АЧХ, подходит для пиков и громких источников</b></div></div>
+        <p class="hint">Примечание: переключение A/C выполняется в коде (функции <span class="mono">apply_a_weighting</span>, фильтры в <span class="mono">filters.py</span>).</p>
+      </div>
+
+      <div class="card">
+        <h3 style="margin:0 0 8px 0;">Временная фильтрация</h3>
+        <div class="row"><div class="kv"><span class="badge">Fast</span><b>α ≈ 0.125</b></div><span class="muted">реагирует быстрее</span></div>
+        <div class="row"><div class="kv"><span class="badge">Slow</span><b>α ≈ 0.03125</b></div><span class="muted">более плавное отображение</span></div>
+        <p class="hint">См. <span class="mono">apply_ema()</span> в <span class="mono">utils.py</span> и переменную <span class="mono">WEIGHTING_MODE</span> в <span class="mono">main.py</span>.</p>
+      </div>
+
+      <div class="card">
+        <h3 style="margin:0 0 8px 0;">Калибровка</h3>
+        <div class="row"><div class="kv"><span class="badge">Файл</span><b class="mono">7142078_90deg.txt</b></div></div>
+        <div class="row"><div class="kv"><span class="badge">Реф. давление</span><b class="mono">20 µPa</b></div></div>
+        <p class="hint">Кривая загружается в <span class="mono">load_calibration_curve()</span> и применяется в <span class="mono">apply_frequency_calibration()</span>.</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3 style="margin:0 0 12px 0;">Текущие значения (по данным БД)</h3>
+      <div class="grid" id="live-cards">
+        <div class="card">
+          <div class="muted">SPL, dB</div>
+          <div id="v-spl" class="big">—</div>
+        </div>
+        <div class="card">
+          <div class="muted">Leq (1s), dB</div>
+          <div id="v-leq" class="big">—</div>
+        </div>
+        <div class="card">
+          <div class="muted">Lmax, dB</div>
+          <div id="v-lmax" class="big">—</div>
+        </div>
+      </div>
+      <p class="hint">Источник: <span class="mono">/api/latest</span> (берём последние 60 записей, отображаем крайнее).</p>
+      <button class="btn" id="btn-refresh">Обновить сейчас</button>
+    </section>
+
+    <section class="card">
+      <h3 style="margin:0 0 8px 0;">Навигация</h3>
+      <div class="grid">
+        <a class="btn" href="/">Открыть таблицу</a>
+        <a class="btn" href="/chart">График SPL</a>
+        <a class="btn" href="/octave">Октавный анализ</a>
+        <a class="btn" href="/rta">RTA</a>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    async function pullLatest() {
+      try {
+        const res = await fetch('/api/latest');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const n = data.spl.length;
+        if (n > 0) {
+          const lastSPL = data.spl[n-1];
+          const lastLeq = data.leq[n-1];
+          const lastLmax = data.lmax[n-1];
+          document.getElementById('v-spl').textContent  = lastSPL  != null ? lastSPL.toFixed(1)  : '—';
+          document.getElementById('v-leq').textContent  = lastLeq  != null ? lastLeq.toFixed(1)  : '—';
+          document.getElementById('v-lmax').textContent = lastLmax != null ? lastLmax.toFixed(1) : '—';
+        }
+      } catch (e) {
+        console.warn('Не удалось получить /api/latest:', e);
+      }
+    }
+
+    document.getElementById('btn-refresh').addEventListener('click', pullLatest);
+    pullLatest();
+    setInterval(pullLatest, 3000); // автообновление раз в 3 сек
+  </script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "device": "UMIK-1",
+  "sensitivity": 0.0045,
+  "reference_db": 120,
+  "weighting_mode": "Slow",
+
+  "analog_device_substr": "USB Audio Device",
+  "analog_sr": 48000,
+  "analog_channels": 1,
+  "analog_block": 2048,
+  "analog_segment_sec": 300,
+  "analog_out_path": "public/analog.wav"
+}

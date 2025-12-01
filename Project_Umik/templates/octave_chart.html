@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>🎚️ Октавный анализ звука</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root{
+      --bg:#0f172a; --panel:#111827; --panel-2:#0b1220;
+      --text:#e5e7eb; --muted:#9ca3af; --border:rgba(255,255,255,.06);
+      --accent:#22d3ee;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      background:
+        radial-gradient(1200px 600px at 20% -10%, rgba(34,211,238,.08), transparent),
+        radial-gradient(900px 500px at 120% 10%, rgba(99,102,241,.08), transparent),
+        var(--bg);
+      color:var(--text);
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Arial;
+    }
+    .container{max-width:1200px;margin:24px auto 56px;padding:0 16px}
+    .page-title{display:flex;align-items:center;gap:12px;font-weight:800;letter-spacing:.2px;font-size:clamp(22px,2.6vw,32px);margin:8px 0 6px}
+    .subtitle{color:var(--muted);font-size:14px;margin:0 0 18px}
+    .tabs{display:flex;gap:8px;margin-bottom:14px}
+    .tab{color:var(--text);text-decoration:none;font-size:14px;padding:8px 12px;border-radius:999px;border:1px solid var(--border);background:rgba(255,255,255,.03)}
+    .tab.active{outline:2px solid rgba(34,211,238,.35)}
+    .card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.03)}
+    .canvas-wrap{width:100%;height:520px}
+    canvas{width:100% !important;height:100% !important;background:#0b0f1a;border:1px solid var(--border);border-radius:14px;padding:8px}
+    .footer{margin-top:14px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+    .btn{
+      margin-top:10px; padding:8px 14px; font-size:14px; cursor:pointer; border-radius:999px;
+      background:rgba(34,211,238,.1); color:var(--text); border:1px solid var(--border);
+    }
+    .btn:hover{outline:2px solid rgba(34,211,238,.25)}
+    .status-ok{color:#34d399}.status-bad{color:#f87171}
+    .legend{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 14px;color:var(--muted);font-size:12px}
+    .chip{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);background:rgba(255,255,255,.03);padding:6px 10px;border-radius:999px}
+    .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="page-title">🎚️ Октавный уровень звука (SPL dBA по частотам)</div>
+    <div class="subtitle">Октавный анализ — последний замер • обновление каждые 5 с</div>
+
+    <!-- Навигация в том же стиле -->
+    <nav class="tabs">
+      <a class="tab" href="/table">Таблица</a>
+      <a class="tab" href="/chart">График SPL</a>
+      <a class="tab active" href="/octave">Октавный анализ</a>
+      <a class="tab" href="/rta">RTA</a>
+      <a class="tab" href="/filtr">Фильтры</a>
+    </nav>
+
+    <div class="card">
+      <div class="legend">
+        <span class="chip"><span class="dot" style="background:#22c55e"></span><span>&lt; 60 дБ — низкий (зелёный)</span></span>
+        <span class="chip"><span class="dot" style="background:#f59e0b"></span><span>60–80 дБ — средний (жёлтый)</span></span>
+        <span class="chip"><span class="dot" style="background:#ef4444"></span><span>&gt;= 80 дБ — высокий (красный)</span></span>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="octaveChart"></canvas>
+      </div>
+
+      <div class="footer">
+        <span id="updateStatus">Статус: ожидаю данные…</span>
+        <button class="btn" onclick="downloadImage()">💾 Скачать график (PNG)</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const ctx = document.getElementById('octaveChart').getContext('2d');
+    const freqs = ["31.5 Hz","63.0 Hz","125.0 Hz","250.0 Hz","500.0 Hz","1000.0 Hz","2000.0 Hz","4000.0 Hz","8000.0 Hz"];
+
+    // цвета по порогам (как в исходнике)
+    function getColor(value){
+      if(value < 60) return '#22c55e'; // зелёный
+      if(value < 80) return '#f59e0b'; // жёлтый/оранжевый
+      return '#ef4444';               // красный
+    }
+
+    const chart = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: freqs,
+        datasets: [{
+          label: 'SPL по полосам (дБ)',
+          data: [],
+          backgroundColor: [],
+          borderColor: 'rgba(255,255,255,.06)',
+          borderWidth: 1,
+          borderRadius: 6
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          title: {
+            display: true,
+            text: 'Октавный анализ – последний замер',
+            color: '#e5e7eb',
+            font: { weight: '700', size: 16 },
+            padding: { top: 4, bottom: 10 }
+          },
+          tooltip: {
+            backgroundColor: 'rgba(17,24,39,.96)',
+            borderColor: 'rgba(255,255,255,.08)',
+            borderWidth: 1,
+            titleColor: '#e5e7eb',
+            bodyColor: '#e5e7eb',
+            callbacks: {
+              label: c => `${c.dataset.label}: ${Number(c.parsed.y).toFixed(1)} dB`
+            }
+          },
+          legend: { labels: { color: '#e5e7eb' } }
+        },
+        scales: {
+          y: {
+            suggestedMin: 30,
+            suggestedMax: 100,
+            ticks: { color: 'rgba(229,231,235,.9)' },
+            grid: { color: 'rgba(255,255,255,.06)' },
+            title: { display: true, text: 'Уровень звука (дБ)', color: '#e5e7eb', padding: 6 }
+          },
+          x: {
+            ticks: { color: 'rgba(229,231,235,.9)' },
+            grid: { color: 'rgba(255,255,255,.06)' },
+            title: { display: true, text: 'Центральная частота полосы', color: '#e5e7eb', padding: 6 }
+          }
+        }
+      }
+    });
+
+    const statusEl = document.getElementById('updateStatus');
+
+    async function updateChart(){
+      try{
+        statusEl.textContent = 'Статус: получаю данные…';
+        const res = await fetch('/api/octave', { cache: 'no-store' });
+        if(!res.ok) throw new Error('HTTP '+res.status);
+        const data = await res.json();
+
+        const values = freqs.map(f => data[f] ?? 0);
+        const colors = values.map(v => getColor(v));
+
+        // обновляем без анимации/мигания
+        chart.data.datasets[0].data = values;
+        chart.data.datasets[0].backgroundColor = colors;
+        chart.update('none');
+
+        statusEl.innerHTML = 'Статус: <span class="status-ok">обновлено</span>';
+      }catch(e){
+        console.error(e);
+        statusEl.innerHTML = 'Статус: <span class="status-bad">ошибка загрузки</span>';
+      }
+    }
+
+    function downloadImage(){
+      const link = document.createElement('a');
+      link.download = 'octave_chart.png';
+      link.href = document.getElementById('octaveChart').toDataURL('image/png');
+      link.click();
+    }
+
+    // первый вызов и интервал
+    updateChart();
+    setInterval(updateChart, 5000);
+  </script>
+</body>
+</html>
