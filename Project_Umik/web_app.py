@@ -7,6 +7,7 @@ import time
 import json
 import threading
 import requests
+import datetime
 from state import get_fft
 
 # ========= Настройки внешней отправки =========
@@ -17,6 +18,25 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))          # пачка для о�
 
 app = Flask(__name__)
 _http = requests.Session()
+
+def get_rpi_serial():
+    serial = "UNKNOWN"
+    try:
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if line.strip().startswith("Serial"):
+                    serial = line.split(":")[1].strip()
+                    break
+    except Exception:
+        pass
+    return serial
+
+
+# Настройки 10-минутного отчёта
+REPORT_API_URL = os.getenv("REPORT_API_URL")  # URL, куда шлём JSON
+REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL_SEC", "600"))  # 600 сек = 10 минут
+DEVICE_ID = os.getenv("DEVICE_ID", get_rpi_serial())  # по умолчанию — серийник RPi
+
 
 # ========= Helpers =========
 
@@ -35,6 +55,86 @@ def get_last_measurements(limit: int = 20):
         return [], []
     columns = list(rows[0].keys())
     return columns, [tuple(r) for r in rows]
+
+def get_10min_max_level():
+    """
+    Возвращает (max_leq, ts_at_max) за последние 10 минут.
+    max_leq: максимальный LAeq (leq_1s) в дБ(A)
+    ts_at_max: timestamp, когда он был измерен.
+    Если данных нет — (None, None).
+    """
+    rows = db_rows(
+        """
+        SELECT timestamp, leq_1s
+        FROM measurements
+        WHERE timestamp >= datetime('now', '-600 seconds')
+          AND leq_1s IS NOT NULL
+        ORDER BY leq_1s DESC
+        LIMIT 1
+        """
+    )
+    if not rows:
+        return None, None
+
+    row = rows[0]
+    return row["leq_1s"], row["timestamp"]
+
+
+def send_10min_report():
+    """
+    Формирует и отправляет JSON вида:
+    {
+      "device_id": "...",
+      "value": <максимальный lmax за 10 минут>,
+      "event_time": "ISO-время этого максимума"
+    }
+    """
+    if not REPORT_API_URL:
+        print("[REPORT] REPORT_API_URL не задан, отправка отключена")
+        return
+
+    max_lmax, ts_at_max = get_10min_max_level()
+    if max_lmax is None or ts_at_max is None:
+        print("[REPORT] За последние 10 минут измерений нет, JSON не отправляем")
+        return
+
+    payload = {
+        "device_id": DEVICE_ID,
+        "value": float(max_lmax),
+        "event_time": ts_at_max
+    }
+
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        resp = _http.post(
+            REPORT_API_URL,
+            data=json.dumps(payload),
+            headers=headers,
+            timeout=10
+        )
+        if 200 <= resp.status_code < 300:
+            print(f"[REPORT] OK value={max_lmax:.2f} dB at {ts_at_max}")
+        else:
+            print(f"[REPORT] FAIL {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[REPORT] ERROR: {e}")
+
+
+def report_loop():
+    if not REPORT_API_URL:
+        print("[REPORT] REPORT_API_URL не задан, репортер не запущен")
+        return
+
+    print(f"[REPORT] Старт репортера: интервал {REPORT_INTERVAL_SEC} сек, URL={REPORT_API_URL}, device_id={DEVICE_ID}")
+    while True:
+        send_10min_report()
+        time.sleep(REPORT_INTERVAL_SEC)
+
+
+def start_reporter():
+    t = threading.Thread(target=report_loop, daemon=True)
+    t.start()
 
 # ========= Pages =========
 
@@ -222,5 +322,6 @@ def start_sender():
 # ========= Запуск =========
 
 if __name__ == "__main__":
-    start_sender()
+    #start_sender()
+    start_reporter()
     app.run(host="0.0.0.0", port=5000, debug=True)
