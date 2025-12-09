@@ -10,11 +10,11 @@ import requests
 import datetime
 from state import get_fft
 
-# ========= Настройки внешней отправки =========
-EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL")         # напр. http://185.231.153.2:8080/ingest
-EXTERNAL_API_TOKEN = os.getenv("EXTERNAL_API_TOKEN")     # если нужен
-SEND_INTERVAL_SEC = float(os.getenv("SEND_INTERVAL_SEC", "1.0"))  # период опроса БД
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))          # пачка для отправки
+EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL")
+EXTERNAL_API_TOKEN = os.getenv("EXTERNAL_API_TOKEN")
+SEND_INTERVAL_SEC = float(os.getenv("SEND_INTERVAL_SEC", "1.0"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
+LAST_ID_FILE = "last_capture_id.txt"
 
 app = Flask(__name__)
 _http = requests.Session()
@@ -32,13 +32,11 @@ def get_rpi_serial():
     return serial
 
 
-# Настройки 10-минутного отчёта
-REPORT_API_URL = os.getenv("REPORT_API_URL")  # URL, куда шлём JSON
-REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL_SEC", "600"))  # 600 сек = 10 минут
-DEVICE_ID = os.getenv("DEVICE_ID", get_rpi_serial())  # по умолчанию — серийник RPi
+REPORT_API_URL = "https://shum.i20h.ru/api/v1/measurements/capture/"
+REPORT_INTERVAL_SEC = 600
+DEVICE_ID = get_rpi_serial()
 
 
-# ========= Helpers =========
 
 def db_rows(query: str, args: tuple = ()) -> list[sqlite3.Row]:
     conn = sqlite3.connect("sound_log.db")
@@ -57,12 +55,7 @@ def get_last_measurements(limit: int = 20):
     return columns, [tuple(r) for r in rows]
 
 def get_10min_max_level():
-    """
-    Возвращает (max_leq, ts_at_max) за последние 10 минут.
-    max_leq: максимальный LAeq (leq_1s) в дБ(A)
-    ts_at_max: timestamp, когда он был измерен.
-    Если данных нет — (None, None).
-    """
+
     rows = db_rows(
         """
         SELECT timestamp, leq_1s
@@ -81,44 +74,58 @@ def get_10min_max_level():
 
 
 def send_10min_report():
-    """
-    Формирует и отправляет JSON вида:
-    {
-      "device_id": "...",
-      "value": <максимальный lmax за 10 минут>,
-      "event_time": "ISO-время этого максимума"
-    }
-    """
     if not REPORT_API_URL:
         print("[REPORT] REPORT_API_URL не задан, отправка отключена")
         return
 
-    max_lmax, ts_at_max = get_10min_max_level()
-    if max_lmax is None or ts_at_max is None:
+    max_leq, ts_at_max = get_10min_max_level()
+    if max_leq is None or ts_at_max is None:
         print("[REPORT] За последние 10 минут измерений нет, JSON не отправляем")
         return
 
-    payload = {
-        "device_id": DEVICE_ID,
-        "value": float(max_lmax),
-        "event_time": ts_at_max
-    }
+    try:
+        dt = datetime.datetime.fromisoformat(ts_at_max)
+    except ValueError:
+        dt = datetime.datetime.strptime(ts_at_max, "%Y-%m-%d %H:%M:%S")
 
-    headers = {"Content-Type": "application/json"}
+    dt = dt.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=3)))
+    event_time_iso = dt.isoformat(timespec="microseconds")
+
+    payload = [
+        {
+            "device_serial": DEVICE_ID,
+            "value": float(max_leq),
+            "event_time": event_time_iso,
+        }
+    ]
 
     try:
         resp = _http.post(
             REPORT_API_URL,
-            data=json.dumps(payload),
-            headers=headers,
+            json=payload,
             timeout=10
         )
         if 200 <= resp.status_code < 300:
-            print(f"[REPORT] OK value={max_lmax:.2f} dB at {ts_at_max}")
+            print(f"[REPORT] OK device_serial={DEVICE_ID} value={max_leq:.2f} dB at {event_time_iso}")
+
+            try:
+                data = resp.json()
+                if isinstance(data, list) and data and "id" in data[0]:
+                    last_id = int(data[0]["id"])
+                    with open(LAST_ID_FILE, "w") as f:
+                        f.write(str(last_id))
+                    print(f"[REPORT] last_capture_id={last_id} сохранён в {LAST_ID_FILE}")
+                else:
+                    print(f"[REPORT] Нестандартный ответ сервера: {data}")
+            except Exception as e_json:
+                print(f"[REPORT] Ошибка разбора ответа сервера: {e_json}")
+
         else:
             print(f"[REPORT] FAIL {resp.status_code}: {resp.text}")
     except Exception as e:
         print(f"[REPORT] ERROR: {e}")
+
+
 
 
 def report_loop():
@@ -136,7 +143,6 @@ def start_reporter():
     t = threading.Thread(target=report_loop, daemon=True)
     t.start()
 
-# ========= Pages =========
 
 @app.route("/")
 def index():
@@ -147,7 +153,6 @@ def index():
 def table_page():
     columns, rows = get_last_measurements()
     return render_template("table.html", columns=columns, rows=rows)
-    # return redirect(url_for("index"))
 
 @app.route("/chart")
 def chart_view():
@@ -169,7 +174,6 @@ def filtr_view():
 def filter_alias():
     return render_template("filtr.html")
 
-# ========= APIs (как у тебя было) =========
 
 @app.route("/api/latest")
 def latest_data():
@@ -210,7 +214,6 @@ def get_fft_api():
         return jsonify(data)
     return jsonify({"freqs": [], "values": []})
 
-# ========= Доп. APIs (удобные срезы) =========
 
 @app.get("/api/health")
 def api_health():
@@ -262,17 +265,14 @@ def api_metrics():
     }
     return jsonify(payload)
 
-# ========= Фоновая отправка новых записей на внешний сервер =========
 
 def _sender_loop():
-    """Без вмешательства в main.py: читаем БД и шлём НОВЫЕ строки на EXTERNAL_API_URL."""
     if not EXTERNAL_API_URL:
         return
     headers = {"Content-Type": "application/json"}
     if EXTERNAL_API_TOKEN:
         headers["Authorization"] = f"Bearer {EXTERNAL_API_TOKEN}"
 
-    # инициализируем «водяной знак»
     last_ts = None
     r = db_rows("SELECT timestamp FROM measurements ORDER BY timestamp DESC LIMIT 1")
     if r:
@@ -319,7 +319,6 @@ def start_sender():
         t = threading.Thread(target=_sender_loop, daemon=True)
         t.start()
 
-# ========= Запуск =========
 
 if __name__ == "__main__":
     #start_sender()
