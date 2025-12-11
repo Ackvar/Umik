@@ -200,7 +200,8 @@ def find_input_device(substr: str) -> int | None:
 
 def get_umick_index():
     for i, dev in enumerate(sd.query_devices()):
-        if dev['max_input_channels'] > 0 and "umik-1" in dev['name'].lower():
+        if dev['max_input_channels'] > 0:
+            print(f"[UMIK] Берём устройство #{i}: {dev['name']}")
             return i
     raise RuntimeError("UMIK-1 не найден")
 
