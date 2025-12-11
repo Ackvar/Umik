@@ -1,32 +1,32 @@
+# main.py
+from __future__ import annotations
+
 import os
 import json
 import time
-import sqlite3
 import threading
+from datetime import datetime, time as dtime
 from collections import deque
 from pathlib import Path
-from datetime import datetime, time as dtime
-from queue import Queue, Empty
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from numpy.fft import rfft, rfftfreq
-import requests
 
-from web_app import app
+import web_app  # наш файл с Flask и 10-минутными репортами
 from state import set_fft
 from calibration_utils import load_calibration_curve, apply_frequency_calibration
 from calibration import apply_calibration
 from weighting import apply_a_weighting
 from utils import apply_ema
 from octave_analysis import octave_band_levels
-from logger import init_csv, log_to_csv
+from logger import init_csv
 from logger_sqlite import init_db, log_to_db, insert_event_start, update_event_end
 from spl_utils import compute_spl, compute_leq
 
-
-DURATION = 1
+# === Основные параметры ===
+DURATION = 1          # секунда на блок
 SAMPLE_RATE = 48000
 REFERENCE_PRESSURE = 20e-6
 
@@ -36,41 +36,34 @@ with open('umik_config.json') as f:
 sensitivity = float(config.get('sensitivity', 0.0045))
 WEIGHTING_MODE = config.get('weighting_mode', 'Slow')
 
-ANALOG_DEVICE_SUBSTR = os.getenv('ANALOG_DEVICE_SUBSTR', config.get('analog_device_substr', '')) 
-ANALOG_SR        = int(os.getenv('ANALOG_SR',        config.get('analog_sr', SAMPLE_RATE)))
-ANALOG_CH        = int(os.getenv('ANALOG_CHANNELS',  config.get('analog_channels', 1)))
-ANALOG_BLOCK     = int(os.getenv('ANALOG_BLOCK',     config.get('analog_block', 2048)))
-SEGMENT_SEC      = int(os.getenv('ANALOG_SEGMENT_SEC', config.get('analog_segment_sec', 300)))  
-OUT_PATH         = Path(os.getenv('ANALOG_OUT_PATH', config.get('analog_out_path', 'public/analog.wav')))
-
+# Калибровка
 freqs, gains = load_calibration_curve("7142078_90deg.txt")
 
+# буфер на 60 секунд для Leq_60s
 leq_buffer = deque(maxlen=60)
 
-DAY_THRESHOLD = 55.0    
-NIGHT_THRESHOLD = 45.0  
+# Пороги по ТЗ
+DAY_THRESHOLD = 55.0    # 07:00–23:00
+NIGHT_THRESHOLD = 45.0  # 23:00–07:00
 
-PRE_EVENT_SEC = 15           
-POST_EVENT_SEC = 15          
+# Параметры событий
+PRE_EVENT_SEC = 15
+POST_EVENT_SEC = 15
 AUDIO_EVENTS_DIR = Path("public/events")
 AUDIO_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
 
-pre_event_buffer = deque(maxlen=PRE_EVENT_SEC) 
+pre_event_buffer = deque(maxlen=PRE_EVENT_SEC)  # храним по 1 секунде
+
 event_recording = False
-event_post_left = 0          
-event_writer = None          
+event_post_left = 0
+event_writer: sf.SoundFile | None = None
 event_max_leq = 0.0
-current_event_id = None
-current_event_threshold = None
-current_event_audio_path = None  
-
-LAST_ID_FILE = "last_capture_id.txt"
-SERVER_BASE = "https://shum.i20h.ru/api/v1"
-session = requests.Session()
+current_event_id: int | None = None
+current_event_threshold: float | None = None
+current_event_path: str | None = None
 
 
-
-def get_current_threshold(now=None) -> float:
+def get_current_threshold(now: datetime | None = None) -> float:
     if now is None:
         now = datetime.now()
     t = now.time()
@@ -80,46 +73,28 @@ def get_current_threshold(now=None) -> float:
         return NIGHT_THRESHOLD
 
 
-def get_last_capture_id() -> int | None:
-
-    try:
-        with open(LAST_ID_FILE, "r") as f:
-            s = f.read().strip()
-            if not s:
-                return None
-            return int(s)
-    except Exception:
-        return None
-
-
-def send_audio_for_last_capture(audio_path: str):
-
-    measurement_id = get_last_capture_id()
-    if measurement_id is None:
-        print("[EVENT->API] Нет сохранённого id 10-минутного измерения, аудио отправить нельзя")
-        return
-
-    audio_url = f"{SERVER_BASE}/measurements/capture/{measurement_id}/audio/"
-    print(f"[EVENT->API] measurement id={measurement_id}, отправляем аудио {audio_path}")
-
-    try:
-        with open(audio_path, "rb") as f:
-            files = {
-                "audio": (os.path.basename(audio_path), f, "audio/wav"),
-            }
-            resp = session.post(audio_url, files=files, timeout=60)
-
-        if 200 <= resp.status_code < 300:
-            print(f"[EVENT->API] OK audio uploaded for measurement {measurement_id}")
-        else:
-            print(f"[EVENT->API] FAIL audio upload: {resp.status_code} {resp.text}")
-    except Exception as e:
-        print(f"[EVENT->API] ERROR audio upload: {e}")
+def get_umick_index() -> int:
+    """
+    Берём первое устройство с входным каналом.
+    В твоём выводе sounddevice это:
+    1 USB PnP Sound Device: Audio (hw:4,0), ALSA (1 in, 2 out)
+    """
+    for i, dev in enumerate(sd.query_devices()):
+        if dev['max_input_channels'] > 0:
+            print(f"[INPUT] Беру устройство #{i}: {dev['name']}")
+            return i
+    raise RuntimeError("Нет ни одного входного аудио-устройства")
 
 
 def start_noise_event(now: datetime, threshold: float):
-    global event_recording, event_writer, event_post_left, event_max_leq
-    global current_event_id, current_event_threshold, current_event_audio_path
+    """
+    Начинаем событие:
+    - открываем WAV
+    - дописываем буфер PRE_EVENT_SEC
+    - создаём запись в БД
+    """
+    global event_recording, event_post_left, event_writer, event_max_leq
+    global current_event_id, current_event_threshold, current_event_path
 
     event_recording = True
     event_post_left = POST_EVENT_SEC
@@ -129,7 +104,7 @@ def start_noise_event(now: datetime, threshold: float):
     ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
     filename = f"event_{now.strftime('%Y%m%dT%H%M%S')}.wav"
     filepath = AUDIO_EVENTS_DIR / filename
-    current_event_audio_path = str(filepath)
+    current_event_path = str(filepath)
 
     event_writer = sf.SoundFile(
         str(filepath),
@@ -139,6 +114,7 @@ def start_noise_event(now: datetime, threshold: float):
         subtype="PCM_16"
     )
 
+    # дописываем историю до события
     for chunk in pre_event_buffer:
         event_writer.write(chunk)
 
@@ -147,67 +123,83 @@ def start_noise_event(now: datetime, threshold: float):
 
 
 def stop_noise_event(now: datetime):
+    """
+    Останавливаем событие:
+    - закрываем WAV
+    - считаем max_leq
+    - отправляем JSON на /capture/
+    - получаем id и отправляем WAV на /capture/{id}/audio/
+    - обновляем запись в БД
+    """
     global event_recording, event_writer, current_event_id, event_max_leq
-    global current_event_threshold, current_event_audio_path
+    global current_event_threshold, current_event_path
 
     if not event_recording:
         return
 
     event_recording = False
-    ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    end_ts = now.strftime("%Y-%m-%d %H:%M:%S")
 
     if event_writer is not None:
         event_writer.close()
         event_writer = None
 
+    measurement_id = None
+
+    # Сначала пытаемся отправить JSON + аудио
+    if web_app.REPORT_API_URL and current_event_path is not None:
+        try:
+            payload = [{
+                "device_serial": web_app.DEVICE_ID,
+                "value": float(event_max_leq),
+                "event_time": end_ts
+            }]
+            print(f"[EVENT] POST JSON for event_id={current_event_id}: {payload}")
+
+            resp = web_app._http.post(web_app.REPORT_API_URL, json=payload, timeout=10)
+            if 200 <= resp.status_code < 300:
+                data = resp.json()
+                if isinstance(data, list) and data:
+                    measurement_id = data[0].get("id")
+                print(f"[EVENT] JSON OK, measurement_id={measurement_id}")
+            else:
+                print(f"[EVENT] JSON FAIL {resp.status_code}: {resp.text}")
+        except Exception as e:
+            print(f"[EVENT] JSON ERROR: {e}")
+
+        # Отправляем аудио, если есть measurement_id
+        if measurement_id is not None:
+            upload_url = f"{web_app.REPORT_API_URL}{measurement_id}/audio/"
+            try:
+                with open(current_event_path, "rb") as f:
+                    files = {"audio": ("event.wav", f, "audio/wav")}
+                    r2 = web_app._http.post(upload_url, files=files, timeout=30)
+                if 200 <= r2.status_code < 300:
+                    print(f"[EVENT] AUDIO OK -> {upload_url}")
+                else:
+                    print(f"[EVENT] AUDIO FAIL {r2.status_code}: {r2.text}")
+            except Exception as e:
+                print(f"[EVENT] AUDIO ERROR: {e}")
+        else:
+            print("[EVENT] measurement_id не получен, аудио не отправляем")
+
+    # Обновляем БД
     if current_event_id is not None:
-        update_event_end(current_event_id, ts_str, event_max_leq)
-        print(f"[EVENT] STOP id={current_event_id} max_leq={event_max_leq:.1f} thr={current_event_threshold:.1f} at {ts_str}")
+        update_event_end(current_event_id, end_ts, event_max_leq, measurement_id)
+        print(
+            f"[EVENT] STOP id={current_event_id} max_leq={event_max_leq:.1f} "
+            f"thr={current_event_threshold:.1f} at {end_ts} meas_id={measurement_id}"
+        )
 
-        if current_event_audio_path is not None:
-            send_audio_for_last_capture(current_event_audio_path)
-
-        current_event_id = None
-        current_event_threshold = None
-        current_event_audio_path = None
-
-
-def init_weighted_table():
-    with sqlite3.connect("sound_log.db") as conn:
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS weighted_measurements (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                weight_type TEXT,
-                spl REAL,
-                leq REAL,
-                lmax REAL
-            )
-        """)
-        conn.commit()
-
-
-def find_input_device(substr: str) -> int | None:
-    if not substr:
-        return None
-    s = substr.lower()
-    for i, dev in enumerate(sd.query_devices()):
-        if dev['max_input_channels'] > 0 and s in dev['name'].lower():
-            return i
-    return None
-
-
-def get_umick_index():
-    for i, dev in enumerate(sd.query_devices()):
-        if dev['max_input_channels'] > 0:
-            print(f"[UMIK] Берём устройство #{i}: {dev['name']}")
-            return i
-    raise RuntimeError("UMIK-1 не найден")
-
+    current_event_id = None
+    current_event_threshold = None
+    current_event_path = None
 
 
 def audio_callback(indata, frames, time_info, status):
+    """
+    Основной callback: считает уровни, пишет в БД, управляет событиями.
+    """
     global event_recording, event_post_left, event_max_leq, event_writer
 
     try:
@@ -215,15 +207,25 @@ def audio_callback(indata, frames, time_info, status):
             print(f"[UMIK] Status: {status}")
 
         mono = indata[:, 0].astype(np.float64)
-
-        pre_event_buffer.append(mono.copy())
-
         now = datetime.now()
+
+        # ---- форс-обрезка события по границе 10-минутного отчёта ----
+        if getattr(web_app, "force_cut_event", False):
+            web_app.force_cut_event = False
+            if event_recording:
+                print("[EVENT] Force cut by 10-min report boundary")
+                stop_noise_event(now)
+                pre_event_buffer.clear()
+        # --------------------------------------------------------------
+
+        # буфер для PRE_EVENT_SEC
+        pre_event_buffer.append(mono.copy())
         threshold = get_current_threshold(now)
 
         pressure_signal = apply_calibration(mono, sensitivity)
         pressure_signal = apply_frequency_calibration(pressure_signal, SAMPLE_RATE, freqs, gains)
 
+        # FFT для веба
         fft_result = np.abs(rfft(pressure_signal))
         fft_freqs = rfftfreq(len(pressure_signal), d=1 / SAMPLE_RATE)
         mask = fft_freqs <= 20000
@@ -240,7 +242,6 @@ def audio_callback(indata, frames, time_info, status):
         leq_1s = compute_leq(weighted, REFERENCE_PRESSURE)
 
         bands = octave_band_levels(weighted, SAMPLE_RATE)
-        print(f"Octaves dBA: {bands}")
 
         leq_buffer.append(weighted)
         all_data = np.concatenate(list(leq_buffer)) if leq_buffer else weighted
@@ -249,11 +250,13 @@ def audio_callback(indata, frames, time_info, status):
 
         print(f"SPL: {spl:.1f} dBA | Leq_1s: {leq_1s:.1f} dBA | Leq_60s: {leq_60s:.1f} dBA | Lmax: {lmax:.1f} dBA")
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
         log_to_db(timestamp, spl, leq_1s, leq_60s, lmax, bands)
 
+        # проверяем превышение
         is_exceed = (leq_1s is not None) and (leq_1s > threshold)
 
+        # если уже пишем событие
         if event_recording and event_writer is not None:
             event_writer.write(mono)
             if leq_1s is not None and leq_1s > event_max_leq:
@@ -261,12 +264,14 @@ def audio_callback(indata, frames, time_info, status):
 
         if event_recording:
             if is_exceed:
+                # шум всё ещё выше порога — продлеваем "хвост"
                 event_post_left = POST_EVENT_SEC
             else:
                 event_post_left -= 1
                 if event_post_left <= 0:
                     stop_noise_event(now)
         else:
+            # не писали — но произошло превышение
             if is_exceed:
                 start_noise_event(now, threshold)
                 if event_writer is not None:
@@ -277,62 +282,24 @@ def audio_callback(indata, frames, time_info, status):
         print(f"[ERROR] UMIK callback crashed: {e}")
 
 
-
-def start_analog_recorder():
-    try:
-        idx = find_input_device(ANALOG_DEVICE_SUBSTR)
-        if idx is None:
-            print("[ANALOG] Устройство не найдено. Запись аналога отключена.")
-            return
-
-        OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        q: Queue[np.ndarray] = Queue(maxsize=50)
-
-        def analog_cb(indata, frames, time_info, status):
-            if status:
-                print(f"[ANALOG] Status: {status}")
-            q.put(indata.copy())
-
-        print(f"[ANALOG] Используется устройство: {sd.query_devices()[idx]['name']} (idx={idx})")
-        with sd.InputStream(device=idx, channels=ANALOG_CH, samplerate=ANALOG_SR,
-                            blocksize=ANALOG_BLOCK, callback=analog_cb, dtype='float32'):
-            print("🎙️ Аналоговый микрофон: запись по 5 минут с перезаписью файла.")
-            while True:
-                with sf.SoundFile(str(OUT_PATH), mode='w', samplerate=ANALOG_SR,
-                                  channels=ANALOG_CH, subtype='PCM_16') as wav:
-                    t_end = time.time() + SEGMENT_SEC
-                    while time.time() < t_end:
-                        try:
-                            block = q.get(timeout=0.5)
-                            wav.write(block)
-                        except Empty:
-                            pass
-                print(f"[ANALOG] Сегмент {SEGMENT_SEC}s записан → {OUT_PATH.name} (перезапись началась заново)")
-
-    except Exception as e:
-        print(f"[ERROR] Аналоговый рекордер не запустился: {e}")
-
-
-
 def start_web():
     if not os.path.exists("templates/table.html"):
         print("[WARNING] Шаблон templates/table.html не найден!")
-    app.run(host="0.0.0.0", port=5000, debug=False)
 
+    # стартуем 10-минутный репортёр
+    web_app.start_reporter()
+
+    web_app.app.run(host="0.0.0.0", port=5000, debug=False)
 
 
 if __name__ == "__main__":
     init_csv()
     init_db()
-    init_weighted_table()
 
+    # веб-интерфейс + репортёр в отдельном потоке
     threading.Thread(target=start_web, daemon=True).start()
 
-    if ANALOG_DEVICE_SUBSTR:
-        threading.Thread(target=start_analog_recorder, daemon=True).start()
-    else:
-        print("[ANALOG] analog_device_substr пуст — аналоговая запись отключена.")
-
+    # основной поток: запись с микрофона
     with sd.InputStream(
         device=get_umick_index(),
         channels=1,
@@ -340,7 +307,7 @@ if __name__ == "__main__":
         samplerate=SAMPLE_RATE,
         blocksize=SAMPLE_RATE * DURATION
     ):
-        print("🎤 Запись с UMIK-1... (нажмите Ctrl+C для выхода)")
+        print("🎤 Запись с микрофона... (нажмите Ctrl+C для выхода)")
         try:
             while True:
                 time.sleep(1)

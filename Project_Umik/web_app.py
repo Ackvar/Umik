@@ -1,23 +1,26 @@
-# app.py
+# web_app.py
 from __future__ import annotations
-from flask import Flask, render_template, jsonify, redirect, url_for, request
+from flask import Flask, render_template, jsonify, request
 import sqlite3
 import os
 import time
 import json
 import threading
 import requests
-import datetime
 from state import get_fft
 
-EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL")
-EXTERNAL_API_TOKEN = os.getenv("EXTERNAL_API_TOKEN")
+# ========= Настройки внешней отправки (старый батчевый экспорт, если нужен) =========
+EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL")         # напр. http://185.231.153.2:8080/ingest
+EXTERNAL_API_TOKEN = os.getenv("EXTERNAL_API_TOKEN")     # если нужен
 SEND_INTERVAL_SEC = float(os.getenv("SEND_INTERVAL_SEC", "1.0"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
-LAST_ID_FILE = "last_capture_id.txt"
 
 app = Flask(__name__)
 _http = requests.Session()
+
+# Флаг: когда удачно ушёл 10-минутный отчёт, нужно обрезать текущий аудио-ивент
+force_cut_event = False
+
 
 def get_rpi_serial():
     serial = "UNKNOWN"
@@ -32,11 +35,17 @@ def get_rpi_serial():
     return serial
 
 
-REPORT_API_URL = "https://shum.i20h.ru/api/v1/measurements/capture/"
-REPORT_INTERVAL_SEC = 600
-DEVICE_ID = get_rpi_serial()
+# ========= Настройки 10-минутного отчёта =========
+REPORT_API_URL = os.getenv(
+    "REPORT_API_URL",
+    "https://shum.i20h.ru/api/v1/measurements/capture/"
+)
+# Для теста 10 секунд, потом поставишь 600
+REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL_SEC", "10"))
+DEVICE_ID = os.getenv("DEVICE_ID", get_rpi_serial())
 
 
+# ========= Helpers =========
 
 def db_rows(query: str, args: tuple = ()) -> list[sqlite3.Row]:
     conn = sqlite3.connect("sound_log.db")
@@ -55,7 +64,11 @@ def get_last_measurements(limit: int = 20):
     return columns, [tuple(r) for r in rows]
 
 def get_10min_max_level():
-
+    """
+    Возвращает (max_leq, ts_at_max) за последние 10 минут.
+    max_leq: максимальный LAeq (leq_1s) в дБ(A)
+    ts_at_max: timestamp, когда он был измерен.
+    """
     rows = db_rows(
         """
         SELECT timestamp, leq_1s
@@ -74,6 +87,18 @@ def get_10min_max_level():
 
 
 def send_10min_report():
+    """
+    Отправляет JSON-список:
+    [
+      {
+        "device_serial": "...",
+        "value": <максимальный Leq_1s за 10 минут>,
+        "event_time": "YYYY-MM-DD HH:MM:SS"
+      }
+    ]
+    При успешной отправке поднимает флаг force_cut_event,
+    чтобы main.py обрезал текущий аудио-ивент.
+    """
     if not REPORT_API_URL:
         print("[REPORT] REPORT_API_URL не задан, отправка отключена")
         return
@@ -83,49 +108,28 @@ def send_10min_report():
         print("[REPORT] За последние 10 минут измерений нет, JSON не отправляем")
         return
 
-    try:
-        dt = datetime.datetime.fromisoformat(ts_at_max)
-    except ValueError:
-        dt = datetime.datetime.strptime(ts_at_max, "%Y-%m-%d %H:%M:%S")
+    payload = [{
+        "device_serial": DEVICE_ID,
+        "value": float(max_leq),
+        "event_time": ts_at_max
+    }]
 
-    dt = dt.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=3)))
-    event_time_iso = dt.isoformat(timespec="microseconds")
-
-    payload = [
-        {
-            "device_serial": DEVICE_ID,
-            "value": float(max_leq),
-            "event_time": event_time_iso,
-        }
-    ]
+    global force_cut_event
 
     try:
         resp = _http.post(
             REPORT_API_URL,
-            json=payload,
+            json=payload,   # отправляем список объектов
             timeout=10
         )
         if 200 <= resp.status_code < 300:
-            print(f"[REPORT] OK device_serial={DEVICE_ID} value={max_leq:.2f} dB at {event_time_iso}")
-
-            try:
-                data = resp.json()
-                if isinstance(data, list) and data and "id" in data[0]:
-                    last_id = int(data[0]["id"])
-                    with open(LAST_ID_FILE, "w") as f:
-                        f.write(str(last_id))
-                    print(f"[REPORT] last_capture_id={last_id} сохранён в {LAST_ID_FILE}")
-                else:
-                    print(f"[REPORT] Нестандартный ответ сервера: {data}")
-            except Exception as e_json:
-                print(f"[REPORT] Ошибка разбора ответа сервера: {e_json}")
-
+            print(f"[REPORT] OK value={max_leq:.2f} dB at {ts_at_max}")
+            # ставим флаг: пора обрезать текущий ивент (если он есть)
+            force_cut_event = True
         else:
             print(f"[REPORT] FAIL {resp.status_code}: {resp.text}")
     except Exception as e:
         print(f"[REPORT] ERROR: {e}")
-
-
 
 
 def report_loop():
@@ -133,7 +137,7 @@ def report_loop():
         print("[REPORT] REPORT_API_URL не задан, репортер не запущен")
         return
 
-    print(f"[REPORT] Старт репортера: интервал {REPORT_INTERVAL_SEC} сек, URL={REPORT_API_URL}, device_id={DEVICE_ID}")
+    print(f"[REPORT] Старт репортера: интервал {REPORT_INTERVAL_SEC} сек, URL={REPORT_API_URL}, device_serial={DEVICE_ID}")
     while True:
         send_10min_report()
         time.sleep(REPORT_INTERVAL_SEC)
@@ -143,6 +147,7 @@ def start_reporter():
     t = threading.Thread(target=report_loop, daemon=True)
     t.start()
 
+# ========= Pages =========
 
 @app.route("/")
 def index():
@@ -174,6 +179,7 @@ def filtr_view():
 def filter_alias():
     return render_template("filtr.html")
 
+# ========= APIs =========
 
 @app.route("/api/latest")
 def latest_data():
@@ -213,7 +219,6 @@ def get_fft_api():
     if data:
         return jsonify(data)
     return jsonify({"freqs": [], "values": []})
-
 
 @app.get("/api/health")
 def api_health():
@@ -265,6 +270,8 @@ def api_metrics():
     }
     return jsonify(payload)
 
+
+# ========= Старый батчевый экспорт (если понадобится) =========
 
 def _sender_loop():
     if not EXTERNAL_API_URL:
@@ -318,9 +325,3 @@ def start_sender():
     if EXTERNAL_API_URL:
         t = threading.Thread(target=_sender_loop, daemon=True)
         t.start()
-
-
-if __name__ == "__main__":
-    #start_sender()
-    start_reporter()
-    app.run(host="0.0.0.0", port=5000, debug=True)
