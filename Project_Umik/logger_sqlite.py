@@ -1,18 +1,18 @@
 # logger_sqlite.py
-from __future__ import annotations
+
 import sqlite3
-from pathlib import Path
 
 DB_NAME = "sound_log.db"
 
-OCTAVE_COLUMNS = [f"{cf:.1f}_Hz" for cf in [31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000]]
+OCTAVE_COLUMNS = [f"{cf:.1f}_Hz" for cf in
+                  [31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000]]
+
 
 def init_db():
-    Path(DB_NAME).touch(exist_ok=True)
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
 
-    # таблица измерений (как было)
+    # Основная таблица измерений
     c.execute(f"""
         CREATE TABLE IF NOT EXISTS measurements (
             timestamp TEXT,
@@ -24,16 +24,15 @@ def init_db():
         );
     """)
 
-    # таблица событий превышения
+    # Таблица событий шума (для аудио)
     c.execute("""
-        CREATE TABLE IF NOT EXISTS events (
+        CREATE TABLE IF NOT EXISTS noise_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            start_ts TEXT,
-            end_ts TEXT,
-            threshold REAL,
-            max_leq REAL,
-            audio_path TEXT,
-            measurement_id INTEGER
+            start_ts   TEXT,
+            end_ts     TEXT,
+            threshold  REAL,
+            max_leq    REAL,
+            audio_path TEXT
         );
     """)
 
@@ -57,13 +56,11 @@ def log_to_db(timestamp, spl, leq_1s, leq_60s, lmax, bands):
 
 
 def insert_event_start(start_ts: str, threshold: float, audio_path: str) -> int:
-    """
-    Создаёт событие превышения шума, возвращает event_id.
-    """
+    """Создаёт запись события и возвращает его id."""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO events (start_ts, threshold, audio_path) VALUES (?, ?, ?)",
+        "INSERT INTO noise_events (start_ts, threshold, audio_path) VALUES (?, ?, ?)",
         (start_ts, threshold, audio_path),
     )
     event_id = c.lastrowid
@@ -72,15 +69,13 @@ def insert_event_start(start_ts: str, threshold: float, audio_path: str) -> int:
     return event_id
 
 
-def update_event_end(event_id: int, end_ts: str, max_leq: float, measurement_id: int | None):
-    """
-    Завершает событие: пишет конец, max_leq и id измерения на сервере (если есть).
-    """
+def update_event_end(event_id: int, end_ts: str, max_leq: float) -> None:
+    """Обновляет запись события концом и максимумом."""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute(
-        "UPDATE events SET end_ts = ?, max_leq = ?, measurement_id = ? WHERE id = ?",
-        (end_ts, max_leq, measurement_id, event_id),
+        "UPDATE noise_events SET end_ts = ?, max_leq = ? WHERE id = ?",
+        (end_ts, max_leq, event_id),
     )
     conn.commit()
     conn.close()
