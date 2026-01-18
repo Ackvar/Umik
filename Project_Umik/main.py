@@ -75,11 +75,14 @@ def get_current_threshold(now: datetime | None = None) -> float:
     return NIGHT_THRESHOLD
 
 
-def get_umick_index():
+def get_umick_index() -> int:
     for i, dev in enumerate(sd.query_devices()):
-        if dev['max_input_channels'] > 0 and "umik-1" in dev['name'].lower():
+        name = (dev.get("name") or "").lower()
+        if dev.get("max_input_channels", 0) > 0:
+            if name.startswith("pulse") or name.startswith("default"):
+                continue
             return i
-    raise RuntimeError("UMIK-1 не найден")
+    raise RuntimeError("Не найдено ни одного физического устройства ввода (микрофона)")
 
 
 def start_noise_event(now: datetime, threshold: float):
