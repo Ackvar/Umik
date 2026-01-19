@@ -128,7 +128,7 @@ def send_10min_report():
         resp = _http.post(
             REPORT_API_URL,
             json=payload,
-            timeout=10
+            timeout=600
         )
         if 200 <= resp.status_code < 300:
             print(f"[REPORT] OK value={max_leq:.2f} dB at {ts_at_max}")
@@ -417,8 +417,100 @@ def start_sender():
         t = threading.Thread(target=_sender_loop, daemon=True)
         t.start()
 
+# ========= Noise RAW (по PDF): отправка 1 раз в секунду =========
+
+NOISE_RAW_API_URL = os.getenv("NOISE_RAW_API_URL", "https://int.kik.mos.ru/noise_raw_data")
+NOISE_RAW_INTERVAL_SEC = float(os.getenv("NOISE_RAW_INTERVAL_SEC", "1.0"))
+
+# координаты оборудования (если нет GPS — задай руками env-переменными)
+LATITUDE_EQUIP = float(os.getenv("LATITUDE_EQUIP", "0"))
+LONGITUDE_EQUIP = float(os.getenv("LONGITUDE_EQUIP", "0"))
+ALTITUDE_EQUIP = float(os.getenv("ALTITUDE_EQUIP", "0"))
+
+# UIN: минимум 1 значение. Можно хранить через запятую: "12345,67890"
+UIN_LIST = [x.strip() for x in os.getenv("UIN_LIST", "0000000000").split(",") if x.strip()]
+
+def _get_last_row():
+    r = db_rows("SELECT * FROM measurements ORDER BY timestamp DESC LIMIT 1")
+    return dict(r[0]) if r else None
+
+def _build_noise_raw_payload(last_row: dict):
+    """
+    Формат из PDF: time_stamp, serial_number, las, dt, timestamp, message_type,
+    latitude_equip, longitude_equip, altitude_equip, uin[]
+    """
+    now_epoch = int(time.time())
+    dt_str = last_row.get("timestamp")  # строка времени из БД (как ты пишешь)
+    # las — берём leq_1s как наиболее “1-сек” метрика, иначе spl
+    las_val = last_row.get("leq_1s", None)
+    if las_val is None:
+        las_val = last_row.get("spl", 0)
+
+    payload = {
+        "time_stamp": now_epoch,               # как "метка времени" (epoch)
+        "serial_number": DEVICE_ID,            # серийник RPi/устройства
+        "las": float(las_val),                 # текущий уровень
+        "dt": dt_str,                          # время измерения строкой
+        "timestamp": now_epoch,                # epoch (часто требуют отдельно)
+        "message_type": "noise_message",
+        "latitude_equip": LATITUDE_EQUIP,
+        "longitude_equip": LONGITUDE_EQUIP,
+        "altitude_equip": ALTITUDE_EQUIP,
+        "uin": UIN_LIST,                       # минимум одно значение
+    }
+    return payload
+
+def _noise_raw_loop():
+    if not NOISE_RAW_API_URL:
+        print("[RAW] NOISE_RAW_API_URL не задан — RAW-отправка выключена")
+        return
+
+    headers = {"Content-Type": "application/json"}
+    last_sent_ts = None  # чтобы не слать одно и то же много раз
+
+    print(f"[RAW] Старт RAW-отправки: {NOISE_RAW_API_URL}, interval={NOISE_RAW_INTERVAL_SEC}s")
+
+    while True:
+        try:
+            row = _get_last_row()
+            if not row:
+                time.sleep(NOISE_RAW_INTERVAL_SEC)
+                continue
+
+            # защита от дублей: сравниваем timestamp из БД
+            ts = row.get("timestamp")
+            if ts == last_sent_ts:
+                time.sleep(NOISE_RAW_INTERVAL_SEC)
+                continue
+
+            payload = _build_noise_raw_payload(row)
+
+            resp = _http.post(
+                NOISE_RAW_API_URL,
+                data=json.dumps(payload),
+                headers=headers,
+                timeout=10
+            )
+
+            if 200 <= resp.status_code < 300:
+                last_sent_ts = ts
+                # можно не спамить лог каждую секунду — но для отладки полезно:
+                # print(f"[RAW] OK las={payload['las']:.1f} dt={payload['dt']}")
+            else:
+                print(f"[RAW] FAIL {resp.status_code}: {resp.text}")
+
+        except Exception as e:
+            print(f"[RAW] ERROR: {e}")
+
+        time.sleep(NOISE_RAW_INTERVAL_SEC)
+
+def start_noise_raw_sender():
+    t = threading.Thread(target=_noise_raw_loop, daemon=True)
+    t.start()
 
 if __name__ == "__main__":
     # start_sender()  # не нужен
-    start_reporter()
+    start_reporter()    
+    start_noise_raw_sender()
     app.run(host="0.0.0.0", port=5000, debug=True)
+

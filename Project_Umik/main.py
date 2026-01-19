@@ -1,17 +1,15 @@
-# main.py
 import os
 import json
 import time
 import threading
+from datetime import datetime, timezone
 from collections import deque
-from pathlib import Path
-from queue import Queue
+from queue import Queue, Full, Empty
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from numpy.fft import rfft, rfftfreq
-from datetime import datetime, time as dtime
 
 from web_app import app, start_reporter, send_event_with_audio
 from state import set_fft
@@ -21,172 +19,205 @@ from weighting import apply_a_weighting
 from utils import apply_ema
 from octave_analysis import octave_band_levels
 from logger import init_csv
-from logger_sqlite import init_db, log_to_db, init_db, insert_event_start, update_event_end
+from logger_sqlite import init_db, log_to_db
 from spl_utils import compute_spl, compute_leq
 
-# === Конфигурация UMIK ===
+# ================== CONFIG ==================
 DURATION = 1
 SAMPLE_RATE = 48000
 REFERENCE_PRESSURE = 20e-6
 
-with open('umik_config.json') as f:
+with open("umik_config.json", "r", encoding="utf-8") as f:
     config = json.load(f)
 
-sensitivity = float(config.get('sensitivity', 0.0045))
-WEIGHTING_MODE = config.get('weighting_mode', 'Slow')
+sensitivity = float(config.get("sensitivity", 0.0045))
+WEIGHTING_MODE = config.get("weighting_mode", "Slow")
 
-# === Калибровка для UMIK ===
+# Порог события (превышение) — из конфига/ENV
+EVENT_THRESHOLD_DB = float(os.getenv("EVENT_THRESHOLD_DB", config.get("event_threshold_db", 45.0)))
+EVENT_PRE_SEC = int(os.getenv("EVENT_PRE_SEC", config.get("event_pre_sec", 15)))
+EVENT_POST_SEC = int(os.getenv("EVENT_POST_SEC", config.get("event_post_sec", 15)))
+EVENT_END_HOLD_SEC = int(os.getenv("EVENT_END_HOLD_SEC", config.get("event_end_hold_sec", 2)))  # сколько секунд ниже порога считаем концом
+EVENT_MIN_SEC = float(os.getenv("EVENT_MIN_SEC", config.get("event_min_sec", 1.0)))
+
+EVENT_OUT_DIR = os.getenv("EVENT_OUT_DIR", config.get("event_out_dir", "public/events"))
+os.makedirs(EVENT_OUT_DIR, exist_ok=True)
+
+# Новый endpoint из PDF (noise_raw_data)
+NOISE_RAW_API_URL = os.getenv("NOISE_RAW_API_URL", "https://int.kik.mos.ru/noise_raw_data")
+NOISE_RAW_ENABLED = os.getenv("NOISE_RAW_ENABLED", "1") == "1"
+
+# Метаданные (из PDF): координаты/УИН/тип сообщения
+SERIAL_NUMBER = os.getenv("SERIAL_NUMBER", config.get("serial_number", ""))  # можно пусто, тогда возьмём cpu serial
+MESSAGE_TYPE = os.getenv("MESSAGE_TYPE", config.get("message_type", "noise_raw_data"))
+
+LAT = os.getenv("LATITUDE_EQUIP", config.get("latitude_equip", None))
+LON = os.getenv("LONGITUDE_EQUIP", config.get("longitude_equip", None))
+ALT = os.getenv("ALTITUDE_EQUIP", config.get("altitude_equip", None))
+
+UIN_LIST = os.getenv("UIN_LIST", config.get("uin_list", ""))
+UIN = [x.strip() for x in UIN_LIST.split(",") if x.strip()]
+
+# Калибровка UMIK
 freqs, gains = load_calibration_curve("7142078_90deg.txt")
 
-# === Буфер Leq для UMIK (60 последних секунд) ===
+# Leq 60 секунд
 leq_buffer = deque(maxlen=60)
 
-# === Пороговые значения ===
-DAY_THRESHOLD = 55.0    # 07:00–23:00
-NIGHT_THRESHOLD = 45.0  # 23:00–07:00
+# ================== HELPERS ==================
+def get_rpi_serial() -> str:
+    serial = "UNKNOWN"
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip().startswith("Serial"):
+                    serial = line.split(":")[1].strip()
+                    break
+    except Exception:
+        pass
+    return serial
 
-# === Аудио события ===
-PRE_EVENT_SEC = 15        # секунд ДО превышения
-POST_EVENT_SEC = 15       # секунд ПОСЛЕ окончания
-AUDIO_EVENTS_DIR = Path("public/events")
-AUDIO_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+if not SERIAL_NUMBER:
+    SERIAL_NUMBER = get_rpi_serial()
 
-pre_event_buffer = deque(maxlen=PRE_EVENT_SEC)
+def pick_input_device() -> int:
+    """
+    Надёжно выбираем устройство ввода.
+    1) Если задан UMIK_DEVICE_INDEX — используем его
+    2) Иначе пробуем найти по miniDSP/umik
+    3) Иначе, если физически один input-девайс (кроме pulse/default) — берём его
+    4) Иначе — sd.default.device[0]
+    """
+    env_idx = os.getenv("UMIK_DEVICE_INDEX")
+    if env_idx is not None:
+        return int(env_idx)
 
-event_recording = False
-event_post_left = 0
-event_writer: sf.SoundFile | None = None
-event_max_leq = 0.0
-event_max_ts: str | None = None
-current_event_id: int | None = None
-current_event_threshold: float | None = None
-current_event_path: str | None = None
+    devices = sd.query_devices()
+    input_idxs = [i for i, d in enumerate(devices) if d.get("max_input_channels", 0) > 0]
 
-# Очередь на отправку события (чтобы не блокировать callback)
-upload_queue: Queue[tuple[float, str, str]] = Queue()
-
-
-def get_current_threshold(now: datetime | None = None) -> float:
-    if now is None:
-        now = datetime.now()
-    t = now.time()
-    if dtime(7, 0) <= t < dtime(23, 0):
-        return DAY_THRESHOLD
-    return NIGHT_THRESHOLD
-
-
-def get_umick_index() -> int:
-    for i, dev in enumerate(sd.query_devices()):
-        name = (dev.get("name") or "").lower()
-        if dev.get("max_input_channels", 0) > 0:
-            if name.startswith("pulse") or name.startswith("default"):
-                continue
+    # 2) поиск по имени
+    for i in input_idxs:
+        name = (devices[i].get("name") or "").lower()
+        if "umik" in name or "minidsp" in name:
             return i
-    raise RuntimeError("Не найдено ни одного физического устройства ввода (микрофона)")
 
+    # 3) если один физический (без pulse/default)
+    physical = []
+    for i in input_idxs:
+        name = (devices[i].get("name") or "").lower()
+        if "pulse" in name or name.strip() == "default":
+            continue
+        physical.append(i)
+    if len(physical) == 1:
+        return physical[0]
 
-def start_noise_event(now: datetime, threshold: float):
-    """Старт события: создаём WAV, пишем префикс, запись в БД."""
-    global event_recording, event_post_left, event_writer
-    global event_max_leq, event_max_ts, current_event_id, current_event_threshold, current_event_path
+    # 4) default input
+    return int(sd.default.device[0])
 
-    event_recording = True
-    event_post_left = POST_EVENT_SEC
-    event_max_leq = 0.0
-    event_max_ts = None
-    current_event_threshold = threshold
+# ================== NOISE_RAW SENDER ==================
+_noise_q: "Queue[dict]" = Queue(maxsize=5)
 
-    ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    filename = f"event_{now.strftime('%Y%m%dT%H%M%S')}.wav"
-    filepath = AUDIO_EVENTS_DIR / filename
-    current_event_path = str(filepath)
+def _noise_raw_sender_loop():
+    import requests
+    s = requests.Session()
 
-    event_writer = sf.SoundFile(
-        str(filepath),
-        mode="w",
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        subtype="PCM_16",
-    )
-
-    # записываем прелоад (15 секунд до события)
-    for chunk in pre_event_buffer:
-        event_writer.write(chunk)
-
-    current_event_id = insert_event_start(ts_str, threshold, str(filepath))
-    print(f"[EVENT] START id={current_event_id} file={filepath} thr={threshold:.1f} dBA")
-
-
-def stop_noise_event(now: datetime):
-    """Завершение события: закрываем файл, обновляем БД и ставим отправку в очередь."""
-    global event_recording, event_writer, current_event_id
-    global event_max_leq, event_max_ts, current_event_threshold, current_event_path
-
-    if not event_recording:
-        return
-
-    event_recording = False
-    ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
-
-    if event_writer is not None:
-        event_writer.close()
-        event_writer = None
-
-    if current_event_id is not None:
-        update_event_end(current_event_id, ts_str, event_max_leq)
-        print(f"[EVENT] STOP id={current_event_id} max_leq={event_max_leq:.1f} "
-              f"thr={current_event_threshold:.1f} at {ts_str}")
-
-    # ставим отправку в очередь (если есть аудио и хоть какой-то уровень)
-    if current_event_path and event_max_leq > 0.0:
-        upload_queue.put((event_max_leq, event_max_ts or ts_str, current_event_path))
-
-    current_event_id = None
-    current_event_threshold = None
-    current_event_path = None
-    event_max_leq = 0.0
-    event_max_ts = None
-
-
-def uploader_worker():
-    """Фоновая отправка JSON+audio для завершённых событий."""
     while True:
-        value, ts_str, audio_path = upload_queue.get()
         try:
-            print(f"[EVENT] UPLOAD queued value={value:.1f} ts={ts_str} file={audio_path}")
-            send_event_with_audio(value, ts_str, audio_path)
+            payload = _noise_q.get(timeout=1.0)
+        except Empty:
+            continue
+
+        # отправка
+        try:
+            r = s.post(
+                NOISE_RAW_API_URL,
+                data=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+                timeout=5,
+            )
+            if not (200 <= r.status_code < 300):
+                print(f"[RAW] FAIL {r.status_code}: {r.text}")
         except Exception as e:
-            print(f"[EVENT] UPLOAD ERROR: {e}")
+            print(f"[RAW] ERROR: {e}")
 
+def start_noise_raw_sender():
+    if not NOISE_RAW_ENABLED:
+        print("[RAW] disabled")
+        return
+    if not NOISE_RAW_API_URL:
+        print("[RAW] NOISE_RAW_API_URL empty, disabled")
+        return
+    t = threading.Thread(target=_noise_raw_sender_loop, daemon=True)
+    t.start()
+    print(f"[RAW] sender started url={NOISE_RAW_API_URL}")
 
+def push_noise_raw(las_value: float):
+    """
+    Формируем JSON по PDF и кладём в очередь (не блокируем аудио callback).
+    """
+    now = datetime.now(timezone.utc)
+    payload = {
+        "serial_number": SERIAL_NUMBER,
+        "las": float(las_value),
+        "dt": now.isoformat().replace("+00:00", "Z"),
+        "time_stamp": int(now.timestamp()),  # unixtime seconds
+        "message_type": MESSAGE_TYPE,
+    }
+    # координаты/высота, если заданы
+    if LAT is not None:
+        payload["latitude_equip"] = float(LAT)
+    if LON is not None:
+        payload["longitude_equip"] = float(LON)
+    if ALT is not None:
+        payload["altitude_equip"] = float(ALT)
+    if UIN:
+        payload["uin"] = UIN
+
+    try:
+        _noise_q.put_nowait(payload)
+    except Full:
+        # если сеть тормозит — пропускаем, чтобы не убить реальное время
+        pass
+
+# ================== EVENT RECORDER ==================
+class EventState:
+    def __init__(self):
+        self.active = False
+        self.event_id = 0
+        self.start_ts = None
+        self.last_above_ts = None
+        self.prebuf = deque(maxlen=EVENT_PRE_SEC * SAMPLE_RATE)
+        self.blocks = []  # list[np.ndarray] raw mono float32
+        self.below_count = 0
+        self.filepath = None
+
+event_state = EventState()
+
+def _write_event_wav(path: str, data: np.ndarray):
+    sf.write(path, data, SAMPLE_RATE, subtype="PCM_16")
+
+# ================== AUDIO CALLBACK ==================
 def audio_callback(indata, frames, time_info, status):
-    global event_recording, event_post_left, event_writer
-    global event_max_leq, event_max_ts
-
     try:
         if status:
             print(f"[UMIK] Status: {status}")
 
-        now = datetime.now()
-        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-        threshold = get_current_threshold(now)
-
         mono = indata[:, 0].astype(np.float64)
 
-        # буфер для 15с до события
-        pre_event_buffer.append(mono.copy())
+        # pre-buffer raw for event (float32)
+        raw_f32 = mono.astype(np.float32)
+        event_state.prebuf.extend(raw_f32)
 
+        # SPL pipeline
         pressure_signal = apply_calibration(mono, sensitivity)
         pressure_signal = apply_frequency_calibration(pressure_signal, SAMPLE_RATE, freqs, gains)
 
-        # FFT → веб
         fft_result = np.abs(rfft(pressure_signal))
         fft_freqs = rfftfreq(len(pressure_signal), d=1 / SAMPLE_RATE)
         mask = fft_freqs <= 20000
         set_fft({"freqs": fft_freqs[mask].tolist(), "values": fft_result[mask].tolist()})
 
         weighted = apply_a_weighting(pressure_signal, SAMPLE_RATE)
-
         if WEIGHTING_MODE == "Fast":
             weighted = apply_ema(weighted, alpha=0.125)
         elif WEIGHTING_MODE == "Slow":
@@ -196,79 +227,126 @@ def audio_callback(indata, frames, time_info, status):
         leq_1s = compute_leq(weighted, REFERENCE_PRESSURE)
 
         bands = octave_band_levels(weighted, SAMPLE_RATE)
-        print(f"Octaves dBA: {bands}")
 
         leq_buffer.append(weighted)
         all_data = np.concatenate(list(leq_buffer)) if leq_buffer else weighted
         leq_60s = compute_leq(all_data, REFERENCE_PRESSURE)
         lmax = 20 * np.log10(np.max(np.abs(weighted)) / REFERENCE_PRESSURE + 1e-15)
 
-        print(f"SPL: {spl:.1f} dBA | Leq_1s: {leq_1s:.1f} dBA | "
-              f"Leq_60s: {leq_60s:.1f} dBA | Lmax: {lmax:.1f} dBA")
+        print(f"SPL: {spl:.1f} dBA | Leq_1s: {leq_1s:.1f} dBA | Leq_60s: {leq_60s:.1f} dBA | Lmax: {lmax:.1f} dBA")
 
-        # логируем в БД
+        # 1) запись в БД
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_to_db(timestamp, spl, leq_1s, leq_60s, lmax, bands)
 
-        # превышение порога?
-        is_exceed = leq_1s is not None and leq_1s > threshold
+        # 2) новый RAW JSON раз в секунду (мы и так в 1Hz callback)
+        if NOISE_RAW_ENABLED:
+            push_noise_raw(leq_1s)
 
-        # если сейчас пишем событие — дозаписываем блок и обновляем максимум
-        if event_recording and event_writer is not None:
-            event_writer.write(mono)
-            if leq_1s is not None and leq_1s > event_max_leq:
-                event_max_leq = leq_1s
-                event_max_ts = timestamp
+        # 3) событие по превышению
+        now_t = time.time()
+        above = leq_1s >= EVENT_THRESHOLD_DB
 
-        # управление состоянием события
-        if event_recording:
-            if is_exceed:
-                # пока шум выше порога — сбрасываем счётчик "после"
-                event_post_left = POST_EVENT_SEC
-            else:
-                event_post_left -= 1
-                if event_post_left <= 0:
-                    stop_noise_event(now)
+        if not event_state.active:
+            if above:
+                event_state.active = True
+                event_state.event_id += 1
+                event_state.start_ts = now_t
+                event_state.last_above_ts = now_t
+                event_state.below_count = 0
+                event_state.blocks = []
+
+                ts_name = datetime.now().strftime("%Y%m%dT%H%M%S")
+                event_state.filepath = os.path.join(EVENT_OUT_DIR, f"event_{ts_name}.wav")
+
+                print(f"[EVENT] START id={event_state.event_id} file={event_state.filepath} thr={EVENT_THRESHOLD_DB:.1f} dBA")
+
+                # сразу положим prebuf как старт
+                pre = np.array(event_state.prebuf, dtype=np.float32)
+                if pre.size > 0:
+                    event_state.blocks.append(pre)
+                event_state.blocks.append(raw_f32.copy())
         else:
-            # не записывали — и вдруг превышение
-            if is_exceed:
-                start_noise_event(now, threshold)
-                if event_writer is not None:
-                    event_writer.write(mono)
-                event_max_leq = leq_1s if leq_1s is not None else 0.0
-                event_max_ts = timestamp
+            # event active
+            event_state.blocks.append(raw_f32.copy())
+            if above:
+                event_state.last_above_ts = now_t
+                event_state.below_count = 0
+            else:
+                event_state.below_count += 1
+
+            # конец события: N секунд ниже порога
+            if event_state.below_count >= EVENT_END_HOLD_SEC:
+                duration_sec = now_t - (event_state.start_ts or now_t)
+                # добавим post хвост фиксированной длины
+                # (post_sec * 1Hz => просто ждём пока callback набежит; проще: набираем EVENT_POST_SEC блоков ниже порога)
+                # В этой реализации: раз уже ниже, добираем EVENT_POST_SEC секунд и закрываем.
+                # Для простоты: используем below_count как количество секунд ниже порога.
+                if event_state.below_count < EVENT_POST_SEC:
+                    return
+
+                # минимальная длина события
+                if duration_sec < EVENT_MIN_SEC:
+                    print(f"[EVENT] DROP too short ({duration_sec:.2f}s)")
+                else:
+                    wav = np.concatenate(event_state.blocks).astype(np.float32)
+                    _write_event_wav(event_state.filepath, wav)
+                    print(f"[EVENT] SAVED {event_state.filepath} len={len(wav)/SAMPLE_RATE:.2f}s")
+
+                    # отправка события + аудио (твоя функция в web_app.py)
+                    try:
+                        send_event_with_audio(
+                            event_id=event_state.event_id,
+                            wav_path=event_state.filepath,
+                            peak_db=float(lmax),
+                            leq_db=float(leq_1s),
+                            threshold_db=float(EVENT_THRESHOLD_DB),
+                            started_at_iso=datetime.fromtimestamp(event_state.start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+                            ended_at_iso=datetime.fromtimestamp(now_t, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+                        )
+                    except Exception as e:
+                        print(f"[EVENT] SEND ERROR: {e}")
+
+                # reset
+                event_state.active = False
+                event_state.blocks = []
+                event_state.start_ts = None
+                event_state.last_above_ts = None
+                event_state.below_count = 0
+                event_state.filepath = None
 
     except Exception as e:
         print(f"[ERROR] UMIK callback crashed: {e}")
 
-
+# ================== WEB SERVER ==================
 def start_web():
-    if not os.path.exists("templates/table.html"):
-        print("[WARNING] Шаблон templates/table.html не найден!")
     app.run(host="0.0.0.0", port=5000, debug=False)
 
-
+# ================== MAIN ==================
 if __name__ == "__main__":
     init_csv()
     init_db()
 
-    # запуск репортера 10-минутных JSON-ов
+    # репортер (10-минутка)
     start_reporter()
 
-    # веб-интерфейс
+    # RAW sender
+    start_noise_raw_sender()
+
+    # веб
     threading.Thread(target=start_web, daemon=True).start()
 
-    # загрузчик событий (JSON + audio)
-    threading.Thread(target=uploader_worker, daemon=True).start()
+    dev_index = pick_input_device()
+    print(f"[AUDIO] input device index={dev_index} name={sd.query_devices()[dev_index]['name']}")
 
-    # основной поток: UMIK-1
     with sd.InputStream(
-        device=get_umick_index(),
+        device=dev_index,
         channels=1,
         callback=audio_callback,
         samplerate=SAMPLE_RATE,
         blocksize=SAMPLE_RATE * DURATION,
     ):
-        print("🎤 Запись с UMIK-1... (нажмите Ctrl+C для выхода)")
+        print("🎤 Запись с UMIK... (Ctrl+C для выхода)")
         try:
             while True:
                 time.sleep(1)
