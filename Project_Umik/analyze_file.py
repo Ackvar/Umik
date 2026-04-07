@@ -1,11 +1,11 @@
 import argparse
-from datetime import datetime
 from scipy.io import wavfile
 from calibration import apply_calibration
 from weighting import apply_weighting
 from analysis import compute_spl, compute_leq
 import sqlite3
 import numpy as np
+from time_utils import format_db_timestamp
 
 def analyze_and_log(filename, weight_type="A", calibration_db=-26.0):
     fs, raw = wavfile.read(filename)
@@ -18,7 +18,7 @@ def analyze_and_log(filename, weight_type="A", calibration_db=-26.0):
     lmax = np.max(weighted)
 
     # Log to database
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = format_db_timestamp()
     conn = sqlite3.connect("sound_log.db")
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS weighted_measurements (

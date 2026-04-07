@@ -21,6 +21,7 @@ from octave_analysis import octave_band_levels
 from logger import init_csv
 from logger_sqlite import init_db, log_to_db
 from spl_utils import compute_spl, compute_leq
+from time_utils import app_now, format_db_timestamp
 
 # ================== CONFIG ==================
 DURATION = 1
@@ -236,7 +237,7 @@ def audio_callback(indata, frames, time_info, status):
         print(f"SPL: {spl:.1f} dBA | Leq_1s: {leq_1s:.1f} dBA | Leq_60s: {leq_60s:.1f} dBA | Lmax: {lmax:.1f} dBA")
 
         # 1) запись в БД
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = format_db_timestamp()
         log_to_db(timestamp, spl, leq_1s, leq_60s, lmax, bands)
 
         # 2) новый RAW JSON раз в секунду (мы и так в 1Hz callback)
@@ -256,7 +257,7 @@ def audio_callback(indata, frames, time_info, status):
                 event_state.below_count = 0
                 event_state.blocks = []
 
-                ts_name = datetime.now().strftime("%Y%m%dT%H%M%S")
+                ts_name = app_now().strftime("%Y%m%dT%H%M%S")
                 event_state.filepath = os.path.join(EVENT_OUT_DIR, f"event_{ts_name}.wav")
 
                 print(f"[EVENT] START id={event_state.event_id} file={event_state.filepath} thr={EVENT_THRESHOLD_DB:.1f} dBA")

@@ -7,8 +7,8 @@ import time
 import json
 import threading
 import requests
-import datetime
 from state import get_fft
+from time_utils import to_utc_iso, window_start_db_timestamp
 
 # ========= Настройки внешней отправки =========
 EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL")
@@ -66,15 +66,17 @@ def get_10min_max_level():
     """
     Возвращает (max_leq, ts_at_max) за последние 10 минут.
     """
+    window_start = window_start_db_timestamp(minutes=10)
     rows = db_rows(
         """
         SELECT timestamp, leq_1s
         FROM measurements
-        WHERE timestamp >= datetime('now', '-10 minutes')
+        WHERE timestamp >= ?
           AND leq_1s IS NOT NULL
-        ORDER BY leq_1s DESC
+        ORDER BY leq_1s DESC, timestamp DESC
         LIMIT 1
-        """
+        """,
+        (window_start,),
     )
     if not rows:
         return None, None
@@ -84,15 +86,8 @@ def get_10min_max_level():
 
 
 def _to_iso(ts_str: str) -> str:
-    """Преобразует 'YYYY-MM-DD HH:MM:SS' -> ISO8601 с Z."""
-    try:
-        dt = datetime.datetime.fromisoformat(ts_str)
-    except ValueError:
-        dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
-    dt_utc = dt.astimezone(datetime.timezone.utc)
-    return dt_utc.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    """Преобразует локальное время проекта в ISO8601 UTC."""
+    return to_utc_iso(ts_str)
 
 
 # ========= 10-минутный отчёт =========
