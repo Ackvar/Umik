@@ -33,12 +33,12 @@ def get_rpi_serial():
     return serial
 
 
-# Настройки 10-минутного (у тебя сейчас тестово 10 секунд)
+# Настройки 10-минутного отчёта
 REPORT_API_URL = os.getenv(
     "REPORT_API_URL",
     "https://shum.i20h.ru/api/v1/measurements/capture/"
 )
-REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL_SEC", "10"))  # для боевого: 600
+REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL_SEC", "600"))  # для боевого: 600
 DEVICE_ID = os.getenv("DEVICE_ID", get_rpi_serial())  # device_serial
 
 
@@ -64,14 +64,13 @@ def get_last_measurements(limit: int = 20):
 
 def get_10min_max_level():
     """
-    Возвращает (max_leq, ts_at_max) за последние 10 минут/секунд.
-    Сейчас окно 10 секунд для теста.
+    Возвращает (max_leq, ts_at_max) за последние 10 минут.
     """
     rows = db_rows(
         """
         SELECT timestamp, leq_1s
         FROM measurements
-        WHERE timestamp >= datetime('now', '-10 seconds')
+        WHERE timestamp >= datetime('now', '-10 minutes')
           AND leq_1s IS NOT NULL
         ORDER BY leq_1s DESC
         LIMIT 1
