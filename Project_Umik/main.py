@@ -1,7 +1,10 @@
 import os
+import glob
 import json
 import time
 import threading
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from collections import deque
 from queue import Queue, Full, Empty
@@ -21,7 +24,7 @@ from octave_analysis import octave_band_levels
 from logger import init_csv
 from logger_sqlite import init_db, log_to_db
 from spl_utils import compute_spl, compute_leq
-from time_utils import app_now, format_db_timestamp
+from time_utils import APP_TIMEZONE, app_now, format_db_timestamp
 
 # ================== CONFIG ==================
 DURATION = 1
@@ -43,6 +46,12 @@ EVENT_MIN_SEC = float(os.getenv("EVENT_MIN_SEC", config.get("event_min_sec", 1.0
 
 EVENT_OUT_DIR = os.getenv("EVENT_OUT_DIR", config.get("event_out_dir", "public/events"))
 os.makedirs(EVENT_OUT_DIR, exist_ok=True)
+ANALOG_OUT_PATH = os.getenv("ANALOG_OUT_PATH", config.get("analog_out_path", ""))
+AUDIO_CLEANUP_INTERVAL_SEC = int(os.getenv("AUDIO_CLEANUP_INTERVAL_SEC", "300"))
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".webm", ".ogg", ".flac", ".m4a", ".aac"}
+EVENT_AUDIO_FORMAT = os.getenv("EVENT_AUDIO_FORMAT", "aac").strip().lower()
+EVENT_AUDIO_BITRATE = os.getenv("EVENT_AUDIO_BITRATE", "96k").strip() or "96k"
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
 
 # Новый endpoint из PDF (noise_raw_data)
 NOISE_RAW_API_URL = os.getenv("NOISE_RAW_API_URL", "https://int.kik.mos.ru/noise_raw_data")
@@ -114,6 +123,142 @@ def pick_input_device() -> int:
 
     # 4) default input
     return int(sd.default.device[0])
+
+
+def _resolve_ffmpeg_bin() -> str | None:
+    if os.path.sep in FFMPEG_BIN or (os.path.altsep and os.path.altsep in FFMPEG_BIN):
+        return FFMPEG_BIN if os.path.exists(FFMPEG_BIN) else None
+
+    found = shutil.which(FFMPEG_BIN)
+    if found:
+        return found
+
+    localappdata = os.getenv("LOCALAPPDATA", "")
+    userprofile = os.getenv("USERPROFILE", "")
+    candidate_patterns = [
+        os.path.join(localappdata, "Microsoft", "WinGet", "Links", "ffmpeg.exe"),
+        os.path.join(localappdata, "Microsoft", "WinGet", "Packages", "Gyan.FFmpeg_*", "**", "bin", "ffmpeg.exe"),
+        os.path.join(userprofile, "scoop", "apps", "ffmpeg", "current", "bin", "ffmpeg.exe"),
+    ]
+    for pattern in candidate_patterns:
+        for candidate in glob.glob(pattern, recursive=True):
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def _event_audio_extension() -> str:
+    return ".m4a" if EVENT_AUDIO_FORMAT == "aac" else ".wav"
+
+
+def _encode_aac_file(src_wav_path: str, out_path: str):
+    ffmpeg_bin = _resolve_ffmpeg_bin()
+    if not ffmpeg_bin:
+        raise RuntimeError("ffmpeg not found; install ffmpeg to save event audio in AAC")
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        src_wav_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-c:a",
+        "aac",
+        "-b:a",
+        EVENT_AUDIO_BITRATE,
+        out_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "unknown ffmpeg error").strip()
+        raise RuntimeError(f"ffmpeg AAC encode failed: {message}")
+
+
+def _write_event_audio(path: str, data: np.ndarray):
+    if EVENT_AUDIO_FORMAT != "aac":
+        sf.write(path, data, SAMPLE_RATE, subtype="PCM_16")
+        return
+
+    temp_wav_path = f"{os.path.splitext(path)[0]}.tmp.wav"
+    try:
+        sf.write(temp_wav_path, data, SAMPLE_RATE, subtype="PCM_16")
+        _encode_aac_file(temp_wav_path, path)
+    finally:
+        if os.path.exists(temp_wav_path):
+            try:
+                os.remove(temp_wav_path)
+            except OSError:
+                pass
+
+
+def log_audio_encoder_status():
+    if EVENT_AUDIO_FORMAT == "aac":
+        ffmpeg_bin = _resolve_ffmpeg_bin()
+        if ffmpeg_bin:
+            print(f"[AUDIO] event format=AAC (.m4a), bitrate={EVENT_AUDIO_BITRATE}, ffmpeg={ffmpeg_bin}")
+        else:
+            print("[AUDIO] event format=AAC (.m4a), but ffmpeg was not found")
+    else:
+        print("[AUDIO] event format=WAV")
+
+
+def _remove_audio_file(path: str) -> bool:
+    try:
+        os.remove(path)
+        print(f"[AUDIO_CLEANUP] deleted {path}")
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        print(f"[AUDIO_CLEANUP] failed to delete {path}: {e}")
+        return False
+
+
+def cleanup_old_audio_files() -> int:
+    today = app_now().date()
+    deleted = 0
+
+    for entry in os.scandir(EVENT_OUT_DIR):
+        if not entry.is_file():
+            continue
+        _, ext = os.path.splitext(entry.name)
+        if ext.lower() not in AUDIO_EXTENSIONS:
+            continue
+
+        file_day = datetime.fromtimestamp(entry.stat().st_mtime, tz=APP_TIMEZONE).date()
+        if file_day < today and _remove_audio_file(entry.path):
+            deleted += 1
+
+    if ANALOG_OUT_PATH and os.path.isfile(ANALOG_OUT_PATH):
+        _, ext = os.path.splitext(ANALOG_OUT_PATH)
+        if ext.lower() in AUDIO_EXTENSIONS:
+            file_day = datetime.fromtimestamp(os.path.getmtime(ANALOG_OUT_PATH), tz=APP_TIMEZONE).date()
+            if file_day < today and _remove_audio_file(ANALOG_OUT_PATH):
+                deleted += 1
+
+    if deleted:
+        print(f"[AUDIO_CLEANUP] deleted {deleted} old audio file(s)")
+
+    return deleted
+
+
+def audio_cleanup_loop():
+    print(f"[AUDIO_CLEANUP] started, interval={AUDIO_CLEANUP_INTERVAL_SEC}s")
+    while True:
+        cleanup_old_audio_files()
+        time.sleep(AUDIO_CLEANUP_INTERVAL_SEC)
+
+
+def start_audio_cleanup():
+    t = threading.Thread(target=audio_cleanup_loop, daemon=True)
+    t.start()
 
 # ================== NOISE_RAW SENDER ==================
 _noise_q: "Queue[dict]" = Queue(maxsize=5)
@@ -194,9 +339,6 @@ class EventState:
 
 event_state = EventState()
 
-def _write_event_wav(path: str, data: np.ndarray):
-    sf.write(path, data, SAMPLE_RATE, subtype="PCM_16")
-
 # ================== AUDIO CALLBACK ==================
 def audio_callback(indata, frames, time_info, status):
     try:
@@ -258,7 +400,7 @@ def audio_callback(indata, frames, time_info, status):
                 event_state.blocks = []
 
                 ts_name = app_now().strftime("%Y%m%dT%H%M%S")
-                event_state.filepath = os.path.join(EVENT_OUT_DIR, f"event_{ts_name}.wav")
+                event_state.filepath = os.path.join(EVENT_OUT_DIR, f"event_{ts_name}{_event_audio_extension()}")
 
                 print(f"[EVENT] START id={event_state.event_id} file={event_state.filepath} thr={EVENT_THRESHOLD_DB:.1f} dBA")
 
@@ -290,23 +432,26 @@ def audio_callback(indata, frames, time_info, status):
                 if duration_sec < EVENT_MIN_SEC:
                     print(f"[EVENT] DROP too short ({duration_sec:.2f}s)")
                 else:
-                    wav = np.concatenate(event_state.blocks).astype(np.float32)
-                    _write_event_wav(event_state.filepath, wav)
-                    print(f"[EVENT] SAVED {event_state.filepath} len={len(wav)/SAMPLE_RATE:.2f}s")
+                    event_audio = np.concatenate(event_state.blocks).astype(np.float32)
+                    try:
+                        _write_event_audio(event_state.filepath, event_audio)
+                        print(f"[EVENT] SAVED {event_state.filepath} len={len(event_audio)/SAMPLE_RATE:.2f}s")
+                    except Exception as e:
+                        print(f"[EVENT] SAVE ERROR: {e}")
 
                     # отправка события + аудио (твоя функция в web_app.py)
-                    try:
-                        send_event_with_audio(
-                            event_id=event_state.event_id,
-                            wav_path=event_state.filepath,
-                            peak_db=float(lmax),
-                            leq_db=float(leq_1s),
-                            threshold_db=float(EVENT_THRESHOLD_DB),
-                            started_at_iso=datetime.fromtimestamp(event_state.start_ts, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
-                            ended_at_iso=datetime.fromtimestamp(now_t, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
-                        )
-                    except Exception as e:
-                        print(f"[EVENT] SEND ERROR: {e}")
+                    else:
+                        # РѕС‚РїСЂР°РІРєР° СЃРѕР±С‹С‚РёСЏ + Р°СѓРґРёРѕ
+                        try:
+                            send_event_with_audio(
+                                value=float(leq_1s),
+                                event_ts=format_db_timestamp(
+                                    datetime.fromtimestamp(event_state.start_ts, tz=APP_TIMEZONE)
+                                ),
+                                audio_path=event_state.filepath,
+                            )
+                        except Exception as e:
+                            print(f"[EVENT] SEND ERROR: {e}")
 
                 # reset
                 event_state.active = False
@@ -330,6 +475,12 @@ if __name__ == "__main__":
 
     # репортер (10-минутка)
     start_reporter()
+
+    # статус кодировщика event-аудио
+    log_audio_encoder_status()
+
+    # ежедневная очистка старых аудиофайлов
+    start_audio_cleanup()
 
     # RAW sender
     start_noise_raw_sender()
