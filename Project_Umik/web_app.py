@@ -7,8 +7,9 @@ import time
 import json
 import threading
 import requests
+from datetime import datetime, timedelta
 from state import get_fft
-from time_utils import to_utc_iso, window_start_db_timestamp
+from time_utils import APP_TIMEZONE, app_now, format_db_timestamp, to_utc_iso
 
 # ========= Настройки внешней отправки =========
 EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL")
@@ -41,6 +42,14 @@ REPORT_API_URL = os.getenv(
 REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL_SEC", "600"))  # для боевого: 600
 DEVICE_ID = os.getenv("DEVICE_ID", get_rpi_serial())  # device_serial
 
+try:
+    with open("umik_config.json", "r", encoding="utf-8") as f:
+        _APP_CONFIG = json.load(f)
+except Exception:
+    _APP_CONFIG = {}
+
+EVENT_THRESHOLD_DB = float(os.getenv("EVENT_THRESHOLD_DB", _APP_CONFIG.get("event_threshold_db", 45.0)))
+
 
 # ========= Helpers =========
 
@@ -62,27 +71,81 @@ def get_last_measurements(limit: int = 20):
     return columns, [tuple(r) for r in rows]
 
 
-def get_10min_max_level():
+def _window_to_db_bounds(
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+) -> tuple[datetime, datetime, str, str]:
+    end_dt = window_end or app_now()
+    start_dt = window_start or (end_dt - timedelta(seconds=REPORT_INTERVAL_SEC))
+    return start_dt, end_dt, format_db_timestamp(start_dt), format_db_timestamp(end_dt)
+
+
+def get_10min_report_measurement(
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+) -> dict | None:
     """
-    Возвращает (max_leq, ts_at_max) за последние 10 минут.
+    Pick one report row for the finished 10-minute window:
+    1) highest threshold exceedance in the window;
+    2) if there was no exceedance, highest value below the threshold.
     """
-    window_start = window_start_db_timestamp(minutes=10)
+    start_dt, end_dt, start_ts, end_ts = _window_to_db_bounds(window_start, window_end)
+
     rows = db_rows(
         """
         SELECT timestamp, leq_1s
         FROM measurements
         WHERE timestamp >= ?
+          AND timestamp < ?
           AND leq_1s IS NOT NULL
+          AND leq_1s >= ?
         ORDER BY leq_1s DESC, timestamp DESC
         LIMIT 1
         """,
-        (window_start,),
+        (start_ts, end_ts, EVENT_THRESHOLD_DB),
     )
+    exceeded = True
+
     if not rows:
-        return None, None
+        rows = db_rows(
+            """
+            SELECT timestamp, leq_1s
+            FROM measurements
+            WHERE timestamp >= ?
+              AND timestamp < ?
+              AND leq_1s IS NOT NULL
+              AND leq_1s < ?
+            ORDER BY leq_1s DESC, timestamp DESC
+            LIMIT 1
+            """,
+            (start_ts, end_ts, EVENT_THRESHOLD_DB),
+        )
+        exceeded = False
+
+    if not rows:
+        return None
 
     row = rows[0]
-    return row["leq_1s"], row["timestamp"]
+    return {
+        "value": row["leq_1s"],
+        "timestamp": row["timestamp"],
+        "exceeded": exceeded,
+        "threshold": EVENT_THRESHOLD_DB,
+        "window_start": start_dt,
+        "window_end": end_dt,
+        "window_start_ts": start_ts,
+        "window_end_ts": end_ts,
+    }
+
+
+def get_10min_max_level():
+    """
+    Возвращает (max_leq, ts_at_max) за последние 10 минут.
+    """
+    selected = get_10min_report_measurement()
+    if not selected:
+        return None, None
+    return selected["value"], selected["timestamp"]
 
 
 def _to_iso(ts_str: str) -> str:
@@ -92,7 +155,69 @@ def _to_iso(ts_str: str) -> str:
 
 # ========= 10-минутный отчёт =========
 
-def send_10min_report():
+def _extract_measurement_id(data):
+    if isinstance(data, list) and data:
+        return data[0].get("id")
+    if isinstance(data, dict):
+        return data.get("id") or data.get("measurement")
+    return None
+
+
+def _send_measurement_json(value: float, event_ts: str, *, prefix: str, timeout: float = 10) -> tuple[bool, int | None]:
+    event_time_iso = _to_iso(event_ts)
+    payload = [{
+        "device_serial": DEVICE_ID,
+        "value": float(value),
+        "event_time": event_time_iso,
+    }]
+
+    try:
+        resp = _http.post(REPORT_API_URL, json=payload, timeout=timeout)
+        if not (200 <= resp.status_code < 300):
+            print(f"{prefix} FAIL JSON {resp.status_code}: {resp.text}")
+            return False, None
+
+        try:
+            data = resp.json()
+        except Exception:
+            print(f"{prefix} JSON OK, but response is not JSON: {resp.text}")
+            return True, None
+
+        measurement_id = _extract_measurement_id(data)
+        if measurement_id is None:
+            print(f"{prefix} JSON OK, measurement id was not returned: {data}")
+            return True, None
+        return True, int(measurement_id)
+    except Exception as e:
+        print(f"{prefix} ERROR JSON: {e}")
+        return False, None
+
+
+def send_audio_for_measurement(measurement_id: int, audio_path: str, *, prefix: str = "[EVENT]") -> bool:
+    if not os.path.exists(audio_path):
+        print(f"{prefix} Файл аудио не найден: {audio_path}")
+        return False
+
+    base = REPORT_API_URL.rstrip("/")
+    audio_url = f"{base}/{measurement_id}/audio/"
+    try:
+        with open(audio_path, "rb") as f:
+            files = {"audio": f}
+            resp = _http.post(audio_url, files=files, timeout=30)
+        if 200 <= resp.status_code < 300:
+            print(f"{prefix} AUDIO OK id={measurement_id} file={audio_path}")
+            return True
+        print(f"{prefix} AUDIO FAIL {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"{prefix} ERROR при отправке аудио: {e}")
+    return False
+
+
+def send_10min_report(
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+    audio_lookup=None,
+):
     """
     Формирует и отправляет JSON вида (список!):
     [
@@ -107,45 +232,88 @@ def send_10min_report():
         print("[REPORT] REPORT_API_URL не задан, отправка отключена")
         return
 
-    max_leq, ts_at_max = get_10min_max_level()
-    if max_leq is None or ts_at_max is None:
+    selected = get_10min_report_measurement(window_start, window_end)
+    if not selected:
         print("[REPORT] За окно измерений данных нет, JSON не отправляем")
         return
 
-    payload = [{
-        "device_serial": DEVICE_ID,
-        "value": float(max_leq),
-        "event_time": _to_iso(ts_at_max),
-    }]
+    value = float(selected["value"])
+    event_ts = selected["timestamp"]
+    audio_path = None
+    if selected["exceeded"] and audio_lookup:
+        try:
+            audio_path = audio_lookup(selected)
+        except Exception as e:
+            print(f"[REPORT] AUDIO lookup error: {e}")
 
-    try:
-        resp = _http.post(
-            REPORT_API_URL,
-            json=payload,
-            timeout=600
-        )
-        if 200 <= resp.status_code < 300:
-            print(f"[REPORT] OK value={max_leq:.2f} dB at {ts_at_max}")
-        else:
-            print(f"[REPORT] FAIL {resp.status_code}: {resp.text}")
-    except Exception as e:
-        print(f"[REPORT] ERROR: {e}")
+    json_ok, measurement_id = _send_measurement_json(value, event_ts, prefix="[REPORT]", timeout=10)
+    if not json_ok:
+        return
+
+    state = "exceedance" if selected["exceeded"] else "below-threshold"
+    print(
+        f"[REPORT] OK {state} value={value:.2f} dB at {event_ts} "
+        f"window={selected['window_start_ts']}..{selected['window_end_ts']}"
+    )
+
+    if audio_path:
+        if measurement_id is None:
+            print(f"[REPORT] AUDIO skipped: measurement id was not returned for {event_ts}")
+            return
+        send_audio_for_measurement(measurement_id, audio_path, prefix="[REPORT]")
 
 
-def report_loop():
+def _next_report_boundary(now: datetime | None = None) -> datetime:
+    now = now or app_now()
+    interval = max(1, REPORT_INTERVAL_SEC)
+    next_epoch = (int(now.timestamp() // interval) + 1) * interval
+    return datetime.fromtimestamp(next_epoch, tz=APP_TIMEZONE)
+
+
+def report_loop(on_window_close=None, audio_lookup=None):
     if not REPORT_API_URL:
         print("[REPORT] REPORT_API_URL не задан, репортер не запущен")
         return
 
     print(f"[REPORT] Старт репортера: интервал {REPORT_INTERVAL_SEC} сек, "
           f"URL={REPORT_API_URL}, device_serial={DEVICE_ID}")
+    next_window_end = _next_report_boundary()
     while True:
-        send_10min_report()
-        time.sleep(REPORT_INTERVAL_SEC)
+        sleep_for = (next_window_end - app_now()).total_seconds()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+        window_end = next_window_end
+        window_start = window_end - timedelta(seconds=REPORT_INTERVAL_SEC)
+
+        if on_window_close:
+            try:
+                on_window_close(window_start, window_end)
+            except Exception as e:
+                print(f"[REPORT] on_window_close error: {e}")
+
+        threading.Thread(
+            target=send_10min_report,
+            kwargs={
+                "window_start": window_start,
+                "window_end": window_end,
+                "audio_lookup": audio_lookup,
+            },
+            daemon=True,
+        ).start()
+
+        next_window_end = next_window_end + timedelta(seconds=REPORT_INTERVAL_SEC)
+        now = app_now()
+        while next_window_end <= now:
+            next_window_end = next_window_end + timedelta(seconds=REPORT_INTERVAL_SEC)
 
 
-def start_reporter():
-    t = threading.Thread(target=report_loop, daemon=True)
+def start_reporter(on_window_close=None, audio_lookup=None):
+    t = threading.Thread(
+        target=report_loop,
+        kwargs={"on_window_close": on_window_close, "audio_lookup": audio_lookup},
+        daemon=True,
+    )
     t.start()
 
 
@@ -162,59 +330,11 @@ def send_event_with_audio(value: float, event_ts: str, audio_path: str):
         print("[EVENT] REPORT_API_URL не задан, отправка события отключена")
         return
 
-    if not os.path.exists(audio_path):
-        print(f"[EVENT] Файл аудио не найден: {audio_path}")
+    json_ok, measurement_id = _send_measurement_json(float(value), event_ts, prefix="[EVENT]", timeout=10)
+    if not json_ok or measurement_id is None:
         return
-
-    event_time_iso = _to_iso(event_ts)
-    payload = [{
-        "device_serial": DEVICE_ID,
-        "value": float(value),
-        "event_time": event_time_iso,
-    }]
-
-    # 1) JSON
-    try:
-        resp = _http.post(REPORT_API_URL, json=payload, timeout=10)
-        if not (200 <= resp.status_code < 300):
-            print(f"[EVENT] FAIL JSON {resp.status_code}: {resp.text}")
-            return
-        try:
-            data = resp.json()
-        except Exception:
-            print(f"[EVENT] Не удалось разобрать JSON ответа: {resp.text}")
-            return
-
-        # Ожидаем список объектов, берём первый
-        measurement_id = None
-        if isinstance(data, list) and data:
-            measurement_id = data[0].get("id")
-        elif isinstance(data, dict):
-            measurement_id = data.get("id") or data.get("measurement")
-
-        if not measurement_id:
-            print(f"[EVENT] Не удалось получить id измерения из ответа: {data}")
-            return
-
-        measurement_id = int(measurement_id)
-        print(f"[EVENT] JSON OK, measurement_id={measurement_id}")
-    except Exception as e:
-        print(f"[EVENT] ERROR при отправке JSON: {e}")
-        return
-
-    # 2) AUDIO
-    base = REPORT_API_URL.rstrip("/")
-    audio_url = f"{base}/{measurement_id}/audio/"
-    try:
-        with open(audio_path, "rb") as f:
-            files = {"audio": f}
-            resp2 = _http.post(audio_url, files=files, timeout=30)
-        if 200 <= resp2.status_code < 300:
-            print(f"[EVENT] AUDIO OK id={measurement_id} file={audio_path}")
-        else:
-            print(f"[EVENT] AUDIO FAIL {resp2.status_code}: {resp2.text}")
-    except Exception as e:
-        print(f"[EVENT] ERROR при отправке аудио: {e}")
+    print(f"[EVENT] JSON OK, measurement_id={measurement_id}")
+    send_audio_for_measurement(measurement_id, audio_path, prefix="[EVENT]")
 
 
 # ========= Страницы =========

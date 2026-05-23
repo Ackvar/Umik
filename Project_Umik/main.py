@@ -5,7 +5,7 @@ import time
 import threading
 import shutil
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from collections import deque
 from queue import Queue, Full, Empty
 
@@ -14,7 +14,7 @@ import sounddevice as sd
 import soundfile as sf
 from numpy.fft import rfft, rfftfreq
 
-from web_app import app, start_reporter, send_event_with_audio
+from web_app import app, start_reporter
 from state import set_fft
 from calibration_utils import load_calibration_curve, apply_frequency_calibration
 from calibration import apply_calibration
@@ -24,7 +24,7 @@ from octave_analysis import octave_band_levels
 from logger import init_csv
 from logger_sqlite import init_db, log_to_db
 from spl_utils import compute_spl, compute_leq
-from time_utils import APP_TIMEZONE, app_now, format_db_timestamp
+from time_utils import APP_TIMEZONE, app_now, format_db_timestamp, parse_db_timestamp
 
 # ================== CONFIG ==================
 DURATION = 1
@@ -328,16 +328,232 @@ def push_noise_raw(las_value: float):
 # ================== EVENT RECORDER ==================
 class EventState:
     def __init__(self):
+        self.lock = threading.RLock()
         self.active = False
         self.event_id = 0
+        self.segment_id = 0
         self.start_ts = None
         self.last_above_ts = None
-        self.prebuf = deque(maxlen=EVENT_PRE_SEC * SAMPLE_RATE)
-        self.blocks = []  # list[np.ndarray] raw mono float32
+        self.segment_start_dt = None
+        self.prebuf = deque(maxlen=max(0, EVENT_PRE_SEC))
+        self.blocks = []  # list[(start_dt, end_dt, raw mono float32)]
         self.below_count = 0
         self.filepath = None
+        self.max_leq = None
+        self.max_ts = None
 
 event_state = EventState()
+completed_event_segments = deque(maxlen=200)
+event_save_lock = threading.RLock()
+
+
+def _make_event_audio_path(event_id: int, segment_id: int) -> str:
+    ts_name = app_now().strftime("%Y%m%dT%H%M%S")
+    return os.path.join(
+        EVENT_OUT_DIR,
+        f"event_{ts_name}_{event_id:04d}_{segment_id:02d}{_event_audio_extension()}",
+    )
+
+
+def _open_event_segment_locked(segment_start_dt: datetime, event_start_ts: float | None = None):
+    event_state.segment_id += 1
+    event_state.segment_start_dt = segment_start_dt
+    event_state.start_ts = event_start_ts if event_start_ts is not None else segment_start_dt.timestamp()
+    event_state.blocks = []
+    event_state.filepath = _make_event_audio_path(event_state.event_id, event_state.segment_id)
+    event_state.max_leq = None
+    event_state.max_ts = None
+
+
+def _reset_event_locked():
+    event_state.active = False
+    event_state.blocks = []
+    event_state.start_ts = None
+    event_state.last_above_ts = None
+    event_state.segment_start_dt = None
+    event_state.below_count = 0
+    event_state.filepath = None
+    event_state.max_leq = None
+    event_state.max_ts = None
+
+
+def _update_segment_peak_locked(leq_1s: float, timestamp: str, above: bool):
+    if not above:
+        return
+    if event_state.max_leq is None or leq_1s > event_state.max_leq:
+        event_state.max_leq = float(leq_1s)
+        event_state.max_ts = timestamp
+
+
+def _slice_audio_block(block, window_start: datetime | None = None, window_end: datetime | None = None):
+    block_start, block_end, data = block[:3]
+    clip_start = block_start if window_start is None or block_start >= window_start else window_start
+    clip_end = block_end if window_end is None or block_end <= window_end else window_end
+    if clip_end <= clip_start:
+        return None
+
+    block_seconds = (block_end - block_start).total_seconds()
+    if block_seconds <= 0:
+        return None
+
+    start_index = int(round((clip_start - block_start).total_seconds() * SAMPLE_RATE))
+    end_index = int(round((clip_end - block_start).total_seconds() * SAMPLE_RATE))
+    start_index = max(0, min(len(data), start_index))
+    end_index = max(0, min(len(data), end_index))
+    if end_index <= start_index:
+        return None
+
+    return (clip_start, clip_end, data[start_index:end_index].copy(), *block[3:])
+
+
+def _segment_peak_from_blocks(blocks, window_start: datetime | None = None, window_end: datetime | None = None):
+    max_leq = None
+    max_ts = None
+
+    for block in blocks:
+        if len(block) < 6:
+            continue
+        _, _, _, leq_1s, timestamp, above = block
+        if not above:
+            continue
+
+        measurement_dt = parse_db_timestamp(timestamp)
+        if window_start is not None and measurement_dt < window_start:
+            continue
+        if window_end is not None and measurement_dt >= window_end:
+            continue
+
+        if max_leq is None or leq_1s > max_leq:
+            max_leq = float(leq_1s)
+            max_ts = timestamp
+
+    return max_leq, max_ts
+
+
+def _collect_segment_audio(blocks, window_start: datetime | None = None, window_end: datetime | None = None):
+    clipped = []
+    chunks = []
+    for block in blocks:
+        sliced = _slice_audio_block(block, window_start, window_end)
+        if not sliced:
+            continue
+        clipped.append(sliced)
+        chunks.append(sliced[2])
+
+    if not chunks:
+        return None
+
+    return {
+        "audio": np.concatenate(chunks).astype(np.float32),
+        "start_dt": clipped[0][0],
+        "end_dt": clipped[-1][1],
+    }
+
+
+def _snapshot_event_segment_locked(window_start: datetime | None = None, window_end: datetime | None = None):
+    collected = _collect_segment_audio(event_state.blocks, window_start, window_end)
+    if not collected:
+        return None
+
+    peak_window_start = window_start
+    if event_state.start_ts is not None:
+        event_start_dt = datetime.fromtimestamp(event_state.start_ts, tz=APP_TIMEZONE)
+        if peak_window_start is None or peak_window_start < event_start_dt:
+            peak_window_start = event_start_dt
+    max_leq, max_ts = _segment_peak_from_blocks(event_state.blocks, peak_window_start, window_end)
+
+    return {
+        **collected,
+        "audio_path": event_state.filepath or _make_event_audio_path(event_state.event_id, event_state.segment_id),
+        "max_leq": max_leq,
+        "max_ts": max_ts,
+        "has_exceedance": max_leq is not None,
+    }
+
+
+def _prune_completed_segments_locked(cutoff_dt: datetime):
+    while completed_event_segments and completed_event_segments[0]["end_dt"] < cutoff_dt:
+        completed_event_segments.popleft()
+
+
+def _save_completed_event_segment(segment: dict | None, reason: str):
+    if not segment:
+        return None
+
+    audio = segment.pop("audio", None)
+    if audio is None or len(audio) == 0:
+        return None
+
+    with event_save_lock:
+        audio_path = segment["audio_path"]
+        try:
+            _write_event_audio(audio_path, audio)
+        except Exception as e:
+            print(f"[EVENT] SAVE ERROR ({reason}): {e}")
+            return None
+
+        duration_sec = len(audio) / SAMPLE_RATE
+        with event_state.lock:
+            completed_event_segments.append(segment)
+            _prune_completed_segments_locked(segment["end_dt"] - timedelta(hours=1))
+
+        peak = f"{segment['max_leq']:.2f}" if segment.get("max_leq") is not None else "n/a"
+        print(f"[EVENT] SAVED {audio_path} reason={reason} len={duration_sec:.2f}s peak={peak}")
+        return audio_path
+
+
+def close_report_window_audio(window_start: datetime, window_end: datetime):
+    segment = None
+    with event_state.lock:
+        if not event_state.active or not event_state.blocks:
+            return
+
+        segment = _snapshot_event_segment_locked(window_start, window_end)
+        remaining_blocks = []
+        for block in event_state.blocks:
+            sliced = _slice_audio_block(block, window_start=window_end)
+            if sliced:
+                remaining_blocks.append(sliced)
+
+        event_state.segment_id += 1
+        event_state.segment_start_dt = window_end
+        event_state.start_ts = window_end.timestamp()
+        event_state.blocks = remaining_blocks
+        event_state.filepath = _make_event_audio_path(event_state.event_id, event_state.segment_id)
+        event_state.max_leq = None
+        event_state.max_ts = None
+
+        print(
+            f"[EVENT] SPLIT window={format_db_timestamp(window_start)}.."
+            f"{format_db_timestamp(window_end)} next_file={event_state.filepath}"
+        )
+
+    _save_completed_event_segment(segment, "WINDOW")
+
+
+def find_report_audio(selected: dict):
+    if not selected.get("exceeded"):
+        return None
+
+    event_dt = parse_db_timestamp(selected["timestamp"])
+    with event_save_lock:
+        with event_state.lock:
+            window_start = selected.get("window_start") or event_dt
+            _prune_completed_segments_locked(window_start - timedelta(hours=1))
+
+            candidates = [
+                segment for segment in completed_event_segments
+                if segment.get("has_exceedance")
+                and segment["start_dt"] <= event_dt <= segment["end_dt"]
+                and os.path.exists(segment["audio_path"])
+            ]
+
+            if not candidates:
+                print(f"[REPORT] AUDIO not found for exceeded measurement at {selected['timestamp']}")
+                return None
+
+            best = max(candidates, key=lambda segment: segment.get("max_leq") or -float("inf"))
+            return best["audio_path"]
 
 # ================== AUDIO CALLBACK ==================
 def audio_callback(indata, frames, time_info, status):
@@ -347,9 +563,10 @@ def audio_callback(indata, frames, time_info, status):
 
         mono = indata[:, 0].astype(np.float64)
 
-        # pre-buffer raw for event (float32)
         raw_f32 = mono.astype(np.float32)
-        event_state.prebuf.extend(raw_f32)
+        block_end_dt = app_now()
+        block_start_dt = block_end_dt - timedelta(seconds=frames / SAMPLE_RATE)
+        audio_samples = raw_f32.copy()
 
         # SPL pipeline
         pressure_signal = apply_calibration(mono, sensitivity)
@@ -379,7 +596,7 @@ def audio_callback(indata, frames, time_info, status):
         print(f"SPL: {spl:.1f} dBA | Leq_1s: {leq_1s:.1f} dBA | Leq_60s: {leq_60s:.1f} dBA | Lmax: {lmax:.1f} dBA")
 
         # 1) запись в БД
-        timestamp = format_db_timestamp()
+        timestamp = format_db_timestamp(block_end_dt)
         log_to_db(timestamp, spl, leq_1s, leq_60s, lmax, bands)
 
         # 2) новый RAW JSON раз в секунду (мы и так в 1Hz callback)
@@ -387,79 +604,52 @@ def audio_callback(indata, frames, time_info, status):
             push_noise_raw(leq_1s)
 
         # 3) событие по превышению
-        now_t = time.time()
+        now_t = block_end_dt.timestamp()
         above = leq_1s >= EVENT_THRESHOLD_DB
+        audio_block = (block_start_dt, block_end_dt, audio_samples, float(leq_1s), timestamp, above)
+        segment_to_save = None
 
-        if not event_state.active:
-            if above:
-                event_state.active = True
-                event_state.event_id += 1
-                event_state.start_ts = now_t
-                event_state.last_above_ts = now_t
-                event_state.below_count = 0
-                event_state.blocks = []
+        with event_state.lock:
+            if not event_state.active:
+                if above:
+                    event_state.active = True
+                    event_state.event_id += 1
+                    event_state.segment_id = 0
+                    event_state.last_above_ts = now_t
+                    event_state.below_count = 0
 
-                ts_name = app_now().strftime("%Y%m%dT%H%M%S")
-                event_state.filepath = os.path.join(EVENT_OUT_DIR, f"event_{ts_name}{_event_audio_extension()}")
+                    segment_start_dt = event_state.prebuf[0][0] if event_state.prebuf else block_start_dt
+                    _open_event_segment_locked(segment_start_dt, event_start_ts=now_t)
+                    event_state.blocks = list(event_state.prebuf) + [audio_block]
+                    _update_segment_peak_locked(leq_1s, timestamp, above)
 
-                print(f"[EVENT] START id={event_state.event_id} file={event_state.filepath} thr={EVENT_THRESHOLD_DB:.1f} dBA")
-
-                # сразу положим prebuf как старт
-                pre = np.array(event_state.prebuf, dtype=np.float32)
-                if pre.size > 0:
-                    event_state.blocks.append(pre)
-                event_state.blocks.append(raw_f32.copy())
-        else:
-            # event active
-            event_state.blocks.append(raw_f32.copy())
-            if above:
-                event_state.last_above_ts = now_t
-                event_state.below_count = 0
+                    print(
+                        f"[EVENT] START id={event_state.event_id} "
+                        f"file={event_state.filepath} thr={EVENT_THRESHOLD_DB:.1f} dBA"
+                    )
             else:
-                event_state.below_count += 1
-
-            # конец события: N секунд ниже порога
-            if event_state.below_count >= EVENT_END_HOLD_SEC:
-                duration_sec = now_t - (event_state.start_ts or now_t)
-                # добавим post хвост фиксированной длины
-                # (post_sec * 1Hz => просто ждём пока callback набежит; проще: набираем EVENT_POST_SEC блоков ниже порога)
-                # В этой реализации: раз уже ниже, добираем EVENT_POST_SEC секунд и закрываем.
-                # Для простоты: используем below_count как количество секунд ниже порога.
-                if event_state.below_count < EVENT_POST_SEC:
-                    return
-
-                # минимальная длина события
-                if duration_sec < EVENT_MIN_SEC:
-                    print(f"[EVENT] DROP too short ({duration_sec:.2f}s)")
+                event_state.blocks.append(audio_block)
+                if above:
+                    event_state.last_above_ts = now_t
+                    event_state.below_count = 0
                 else:
-                    event_audio = np.concatenate(event_state.blocks).astype(np.float32)
-                    try:
-                        _write_event_audio(event_state.filepath, event_audio)
-                        print(f"[EVENT] SAVED {event_state.filepath} len={len(event_audio)/SAMPLE_RATE:.2f}s")
-                    except Exception as e:
-                        print(f"[EVENT] SAVE ERROR: {e}")
+                    event_state.below_count += 1
 
-                    # отправка события + аудио (твоя функция в web_app.py)
+                _update_segment_peak_locked(leq_1s, timestamp, above)
+
+                post_blocks_needed = max(EVENT_END_HOLD_SEC, EVENT_POST_SEC)
+                if event_state.below_count >= post_blocks_needed:
+                    duration_sec = now_t - (event_state.start_ts or now_t)
+                    if duration_sec < EVENT_MIN_SEC:
+                        print(f"[EVENT] DROP too short ({duration_sec:.2f}s)")
                     else:
-                        # РѕС‚РїСЂР°РІРєР° СЃРѕР±С‹С‚РёСЏ + Р°СѓРґРёРѕ
-                        try:
-                            send_event_with_audio(
-                                value=float(leq_1s),
-                                event_ts=format_db_timestamp(
-                                    datetime.fromtimestamp(event_state.start_ts, tz=APP_TIMEZONE)
-                                ),
-                                audio_path=event_state.filepath,
-                            )
-                        except Exception as e:
-                            print(f"[EVENT] SEND ERROR: {e}")
+                        segment_to_save = _snapshot_event_segment_locked()
 
-                # reset
-                event_state.active = False
-                event_state.blocks = []
-                event_state.start_ts = None
-                event_state.last_above_ts = None
-                event_state.below_count = 0
-                event_state.filepath = None
+                    _reset_event_locked()
+
+            event_state.prebuf.append(audio_block)
+
+        _save_completed_event_segment(segment_to_save, "END")
 
     except Exception as e:
         print(f"[ERROR] UMIK callback crashed: {e}")
@@ -474,7 +664,10 @@ if __name__ == "__main__":
     init_db()
 
     # репортер (10-минутка)
-    start_reporter()
+    start_reporter(
+        on_window_close=close_report_window_audio,
+        audio_lookup=find_report_audio,
+    )
 
     # статус кодировщика event-аудио
     log_audio_encoder_status()
