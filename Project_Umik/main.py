@@ -663,7 +663,7 @@ if __name__ == "__main__":
     init_csv()
     init_db()
 
-    # репортер (10-минутка)
+    # репортер capture-отчёта
     start_reporter(
         on_window_close=close_report_window_audio,
         audio_lookup=find_report_audio,

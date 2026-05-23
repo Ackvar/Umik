@@ -8,6 +8,7 @@ import json
 import threading
 import requests
 from datetime import datetime, timedelta
+from urllib.parse import quote
 from state import get_fft
 from time_utils import APP_TIMEZONE, app_now, format_db_timestamp, to_utc_iso
 
@@ -34,12 +35,12 @@ def get_rpi_serial():
     return serial
 
 
-# Настройки 10-минутного отчёта
+# Настройки периодического capture-отчёта
 REPORT_API_URL = os.getenv(
     "REPORT_API_URL",
     "https://shum.i20h.ru/api/v1/measurements/capture/"
 )
-REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL_SEC", "600"))  # для боевого: 600
+REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL_SEC", "120"))  # 2 минуты
 DEVICE_ID = os.getenv("DEVICE_ID", get_rpi_serial())  # device_serial
 
 try:
@@ -85,7 +86,7 @@ def get_10min_report_measurement(
     window_end: datetime | None = None,
 ) -> dict | None:
     """
-    Pick one report row for the finished 10-minute window:
+    Pick one report row for the finished report window:
     1) highest threshold exceedance in the window;
     2) if there was no exceedance, highest value below the threshold.
     """
@@ -140,7 +141,7 @@ def get_10min_report_measurement(
 
 def get_10min_max_level():
     """
-    Возвращает (max_leq, ts_at_max) за последние 10 минут.
+    Возвращает (max_leq, ts_at_max) за последнее окно отчёта.
     """
     selected = get_10min_report_measurement()
     if not selected:
@@ -153,7 +154,17 @@ def _to_iso(ts_str: str) -> str:
     return to_utc_iso(ts_str)
 
 
-# ========= 10-минутный отчёт =========
+def _report_capture_url() -> str:
+    base = REPORT_API_URL.rstrip("/")
+    device_serial = str(DEVICE_ID).strip()
+    encoded_serial = quote(device_serial, safe="")
+    last_segment = base.rsplit("/", 1)[-1]
+    if last_segment in {device_serial, encoded_serial}:
+        return f"{base}/"
+    return f"{base}/{encoded_serial}/"
+
+
+# ========= Периодический capture-отчёт =========
 
 def _extract_measurement_id(data):
     if isinstance(data, list) and data:
@@ -166,13 +177,12 @@ def _extract_measurement_id(data):
 def _send_measurement_json(value: float, event_ts: str, *, prefix: str, timeout: float = 10) -> tuple[bool, int | None]:
     event_time_iso = _to_iso(event_ts)
     payload = [{
-        "device_serial": DEVICE_ID,
         "value": float(value),
         "event_time": event_time_iso,
     }]
 
     try:
-        resp = _http.post(REPORT_API_URL, json=payload, timeout=timeout)
+        resp = _http.post(_report_capture_url(), json=payload, timeout=timeout)
         if not (200 <= resp.status_code < 300):
             print(f"{prefix} FAIL JSON {resp.status_code}: {resp.text}")
             return False, None
@@ -198,7 +208,7 @@ def send_audio_for_measurement(measurement_id: int, audio_path: str, *, prefix: 
         print(f"{prefix} Файл аудио не найден: {audio_path}")
         return False
 
-    base = REPORT_API_URL.rstrip("/")
+    base = _report_capture_url().rstrip("/")
     audio_url = f"{base}/{measurement_id}/audio/"
     try:
         with open(audio_path, "rb") as f:
@@ -222,7 +232,6 @@ def send_10min_report(
     Формирует и отправляет JSON вида (список!):
     [
       {
-        "device_serial": "...",
         "value": <максимальный leq_1s>,
         "event_time": "ISO-время этого максимума"
       }
@@ -276,7 +285,7 @@ def report_loop(on_window_close=None, audio_lookup=None):
         return
 
     print(f"[REPORT] Старт репортера: интервал {REPORT_INTERVAL_SEC} сек, "
-          f"URL={REPORT_API_URL}, device_serial={DEVICE_ID}")
+          f"URL={_report_capture_url()}")
     next_window_end = _next_report_boundary()
     while True:
         sleep_for = (next_window_end - app_now()).total_seconds()
