@@ -22,7 +22,7 @@ from weighting import apply_a_weighting
 from utils import apply_ema
 from octave_analysis import octave_band_levels
 from logger import init_csv
-from logger_sqlite import init_db, log_to_db
+from logger_sqlite import init_db, log_to_db, recover_corrupt_db
 from spl_utils import compute_spl, compute_leq
 from time_utils import APP_TIMEZONE, app_now, format_db_timestamp, parse_db_timestamp
 
@@ -73,6 +73,63 @@ freqs, gains = load_calibration_curve("7142078_90deg.txt")
 
 # Leq 60 секунд
 leq_buffer = deque(maxlen=60)
+
+# SQLite can block on locks; never do DB I/O inside the PortAudio callback.
+DB_LOG_QUEUE_SIZE = int(os.getenv("DB_LOG_QUEUE_SIZE", "300"))
+_db_log_q: "Queue[tuple]" = Queue(maxsize=DB_LOG_QUEUE_SIZE)
+_db_log_last_error_ts = 0.0
+_db_log_dropped = 0
+
+
+def _log_db_writer_error(message: str):
+    global _db_log_last_error_ts
+    now = time.time()
+    if now - _db_log_last_error_ts >= 30:
+        print(message)
+        _db_log_last_error_ts = now
+
+
+def enqueue_db_log(timestamp, spl, leq_1s, leq_60s, lmax, bands: dict):
+    global _db_log_dropped
+    item = (timestamp, spl, leq_1s, leq_60s, lmax, dict(bands))
+    try:
+        _db_log_q.put_nowait(item)
+    except Full:
+        try:
+            _db_log_q.get_nowait()
+            _db_log_q.task_done()
+        except Empty:
+            pass
+        _db_log_dropped += 1
+        try:
+            _db_log_q.put_nowait(item)
+        except Full:
+            pass
+        _log_db_writer_error(f"[DB] writer queue full, dropped={_db_log_dropped}")
+
+
+def db_writer_loop():
+    print(f"[DB] writer started, queue={DB_LOG_QUEUE_SIZE}")
+    while True:
+        item = _db_log_q.get()
+        try:
+            log_to_db(*item)
+        except Exception as e:
+            if "malformed" in str(e).lower():
+                _log_db_writer_error(f"[DB] database is malformed, recreating sound_log.db: {e}")
+                try:
+                    recover_corrupt_db(e)
+                except Exception as recover_error:
+                    _log_db_writer_error(f"[DB] recovery failed: {recover_error}")
+            else:
+                _log_db_writer_error(f"[DB] write failed: {e}")
+        finally:
+            _db_log_q.task_done()
+
+
+def start_db_writer():
+    t = threading.Thread(target=db_writer_loop, daemon=True)
+    t.start()
 
 # ================== HELPERS ==================
 def get_rpi_serial() -> str:
@@ -597,7 +654,7 @@ def audio_callback(indata, frames, time_info, status):
 
         # 1) запись в БД
         timestamp = format_db_timestamp(block_end_dt)
-        log_to_db(timestamp, spl, leq_1s, leq_60s, lmax, bands)
+        enqueue_db_log(timestamp, spl, leq_1s, leq_60s, lmax, bands)
 
         # 2) новый RAW JSON раз в секунду (мы и так в 1Hz callback)
         if NOISE_RAW_ENABLED:
@@ -662,6 +719,7 @@ def start_web():
 if __name__ == "__main__":
     init_csv()
     init_db()
+    start_db_writer()
 
     # репортер capture-отчёта
     start_reporter(

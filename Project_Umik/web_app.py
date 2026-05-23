@@ -10,6 +10,7 @@ import requests
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from state import get_fft
+from logger_sqlite import BUSY_TIMEOUT_MS, DB_NAME, recover_corrupt_db
 from time_utils import APP_TIMEZONE, app_now, format_db_timestamp, to_utc_iso
 
 # ========= Настройки внешней отправки =========
@@ -20,6 +21,7 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
 
 app = Flask(__name__)
 _http = requests.Session()
+_last_db_error_log = 0.0
 
 
 def get_rpi_serial():
@@ -55,13 +57,32 @@ EVENT_THRESHOLD_DB = float(os.getenv("EVENT_THRESHOLD_DB", _APP_CONFIG.get("even
 # ========= Helpers =========
 
 def db_rows(query: str, args: tuple = ()) -> list[sqlite3.Row]:
-    conn = sqlite3.connect("sound_log.db")
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute(query, args)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    global _last_db_error_log
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS};")
+        cur = conn.cursor()
+        cur.execute(query, args)
+        return cur.fetchall()
+    except sqlite3.DatabaseError as e:
+        now = time.time()
+        if now - _last_db_error_log >= 30:
+            print(f"[DB] read failed: {e}")
+            _last_db_error_log = now
+        if "malformed" in str(e).lower():
+            if conn is not None:
+                conn.close()
+                conn = None
+            try:
+                recover_corrupt_db(e)
+            except Exception as recover_error:
+                print(f"[DB] recovery failed: {recover_error}")
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def get_last_measurements(limit: int = 20):
@@ -389,11 +410,7 @@ def filter_alias():
 
 @app.route("/api/latest")
 def latest_data():
-    conn = sqlite3.connect("sound_log.db")
-    c = conn.cursor()
-    c.execute("SELECT timestamp, spl, leq_1s, lmax FROM measurements ORDER BY timestamp DESC LIMIT 60")
-    rows = c.fetchall()
-    conn.close()
+    rows = db_rows("SELECT timestamp, spl, leq_1s, lmax FROM measurements ORDER BY timestamp DESC LIMIT 60")
     data = {
         "timestamps": [r[0] for r in reversed(rows)],
         "spl": [r[1] for r in reversed(rows)],
@@ -405,13 +422,9 @@ def latest_data():
 
 @app.route("/api/octave")
 def get_latest_octaves():
-    conn = sqlite3.connect("sound_log.db")
-    c = conn.cursor()
-    c.execute("SELECT * FROM measurements ORDER BY timestamp DESC LIMIT 1")
-    row = c.fetchone()
-    columns = [desc[0] for desc in c.description] if c.description else []
-    conn.close()
-    if row:
+    rows = db_rows("SELECT * FROM measurements ORDER BY timestamp DESC LIMIT 1")
+    if rows:
+        row = rows[0]
         target_freqs = [
             "31.5 Hz", "63.0 Hz", "125.0 Hz", "250.0 Hz",
             "500.0 Hz", "1000.0 Hz", "2000.0 Hz", "4000.0 Hz", "8000.0 Hz",
