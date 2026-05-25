@@ -37,10 +37,13 @@ def get_rpi_serial():
     return serial
 
 
-# Настройки периодического capture-отчёта
+# Настройки периодического capture-отчёта.
+# Двухминутный JSON отправляется на endpoint вида:
+# https://shum.i20h.ru/api/v1/measurements/capture/<device_serial>/
+# В REPORT_API_URL можно указывать либо базовый URL без серийника, либо URL с шаблоном <str:device_serial>.
 REPORT_API_URL = os.getenv(
     "REPORT_API_URL",
-    "https://shum.i20h.ru/api/v1/measurements/capture/"
+    "https://shum.i20h.ru/api/v1/measurements/capture"
 )
 REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL_SEC", "120"))  # 2 минуты
 DEVICE_ID = os.getenv("DEVICE_ID", get_rpi_serial())  # device_serial
@@ -176,12 +179,32 @@ def _to_iso(ts_str: str) -> str:
 
 
 def _report_capture_url() -> str:
-    base = REPORT_API_URL.rstrip("/")
+    """
+    Возвращает полный endpoint для capture-отчёта.
+
+    Поддерживает оба варианта настройки REPORT_API_URL:
+    1) базовый URL без серийника:
+       https://shum.i20h.ru/api/v1/measurements/capture
+    2) URL-шаблон Django из задачи:
+       https://shum.i20h.ru/api/v1/measurements/capture/<str:device_serial>/
+    """
+    base = (REPORT_API_URL or "").strip().rstrip("/")
     device_serial = str(DEVICE_ID).strip()
     encoded_serial = quote(device_serial, safe="")
+
+    if not base:
+        return ""
+
+    # Если в env случайно/специально вставили Django-шаблон, заменяем его на настоящий serial.
+    for placeholder in ("<str:device_serial>", "<device_serial>", "{device_serial}"):
+        if placeholder in base:
+            return f"{base.replace(placeholder, encoded_serial).rstrip('/')}/"
+
+    # Если serial уже стоит последним сегментом URL, не добавляем второй раз.
     last_segment = base.rsplit("/", 1)[-1]
     if last_segment in {device_serial, encoded_serial}:
         return f"{base}/"
+
     return f"{base}/{encoded_serial}/"
 
 
@@ -555,7 +578,11 @@ def start_sender():
 
 # ========= Noise RAW (по PDF): отправка 1 раз в секунду =========
 
-NOISE_RAW_API_URL = os.getenv("NOISE_RAW_API_URL", "https://int.kik.mos.ru/noise_raw_data")
+# RAW-отправка выключена по умолчанию, чтобы не спамить 404 на старый endpoint.
+# Включай только когда будет точный рабочий NOISE_RAW_API_URL:
+# export NOISE_RAW_ENABLED=1
+NOISE_RAW_ENABLED = os.getenv("NOISE_RAW_ENABLED", "0") == "1"
+NOISE_RAW_API_URL = os.getenv("NOISE_RAW_API_URL", "")
 NOISE_RAW_INTERVAL_SEC = float(os.getenv("NOISE_RAW_INTERVAL_SEC", "1.0"))
 
 # координаты оборудования (если нет GPS — задай руками env-переменными)
@@ -641,6 +668,9 @@ def _noise_raw_loop():
         time.sleep(NOISE_RAW_INTERVAL_SEC)
 
 def start_noise_raw_sender():
+    if not NOISE_RAW_ENABLED:
+        print("[RAW] disabled")
+        return
     t = threading.Thread(target=_noise_raw_loop, daemon=True)
     t.start()
 

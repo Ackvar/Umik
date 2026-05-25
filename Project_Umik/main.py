@@ -53,9 +53,12 @@ EVENT_AUDIO_FORMAT = os.getenv("EVENT_AUDIO_FORMAT", "aac").strip().lower()
 EVENT_AUDIO_BITRATE = os.getenv("EVENT_AUDIO_BITRATE", "96k").strip() or "96k"
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
 
-# Новый endpoint из PDF (noise_raw_data)
-NOISE_RAW_API_URL = os.getenv("NOISE_RAW_API_URL", "https://int.kik.mos.ru/noise_raw_data")
-NOISE_RAW_ENABLED = os.getenv("NOISE_RAW_ENABLED", "1") == "1"
+# RAW endpoint из PDF. По умолчанию выключен, потому что старый URL даёт 404.
+# Двухминутный capture-JSON отправляет web_app.start_reporter() через REPORT_API_URL.
+# RAW включай только если дали рабочий NOISE_RAW_API_URL:
+# export NOISE_RAW_ENABLED=1
+NOISE_RAW_API_URL = os.getenv("NOISE_RAW_API_URL", "")
+NOISE_RAW_ENABLED = os.getenv("NOISE_RAW_ENABLED", "0") == "1"
 
 # Метаданные (из PDF): координаты/УИН/тип сообщения
 SERIAL_NUMBER = os.getenv("SERIAL_NUMBER", config.get("serial_number", ""))  # можно пусто, тогда возьмём cpu serial
