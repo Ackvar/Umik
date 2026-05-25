@@ -45,6 +45,13 @@ REPORT_API_URL = os.getenv(
     "REPORT_API_URL",
     "https://shum.i20h.ru/api/v1/measurements/capture"
 )
+# Аудио endpoint на сервере имеет вид:
+# https://shum.i20h.ru/api/v1/measurements/capture/<pk>/audio/
+# Поэтому здесь используем базовый capture URL БЕЗ device_serial.
+AUDIO_API_URL = os.getenv(
+    "AUDIO_API_URL",
+    "https://shum.i20h.ru/api/v1/measurements/capture"
+)
 REPORT_INTERVAL_SEC = int(os.getenv("REPORT_INTERVAL_SEC", "120"))  # 2 минуты
 DEVICE_ID = os.getenv("DEVICE_ID", get_rpi_serial())  # device_serial
 
@@ -247,23 +254,37 @@ def _send_measurement_json(value: float, event_ts: str, *, prefix: str, timeout:
         return False, None
 
 
+def _audio_upload_url(measurement_id: int) -> str:
+    """
+    Возвращает endpoint для отправки аудио.
+
+    Важно: audio endpoint на сервере: capture/<int:pk>/audio/
+    Поэтому device_serial сюда НЕ добавляем.
+    """
+    base = (AUDIO_API_URL or "").strip().rstrip("/")
+    return f"{base}/{int(measurement_id)}/audio/"
+
+
 def send_audio_for_measurement(measurement_id: int, audio_path: str, *, prefix: str = "[EVENT]") -> bool:
     if not os.path.exists(audio_path):
         print(f"{prefix} Файл аудио не найден: {audio_path}")
         return False
 
-    base = _report_capture_url().rstrip("/")
-    audio_url = f"{base}/{measurement_id}/audio/"
+    if not AUDIO_API_URL:
+        print(f"{prefix} AUDIO_API_URL не задан, отправка аудио отключена")
+        return False
+
+    audio_url = _audio_upload_url(measurement_id)
     try:
         with open(audio_path, "rb") as f:
             files = {"audio": f}
             resp = _http.post(audio_url, files=files, timeout=30)
         if 200 <= resp.status_code < 300:
-            print(f"{prefix} AUDIO OK id={measurement_id} file={audio_path}")
+            print(f"{prefix} AUDIO OK id={measurement_id} url={audio_url} file={audio_path}")
             return True
-        print(f"{prefix} AUDIO FAIL {resp.status_code}: {resp.text}")
+        print(f"{prefix} AUDIO FAIL {resp.status_code} url={audio_url}: {resp.text}")
     except Exception as e:
-        print(f"{prefix} ERROR при отправке аудио: {e}")
+        print(f"{prefix} ERROR при отправке аудио url={audio_url}: {e}")
     return False
 
 
