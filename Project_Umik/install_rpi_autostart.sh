@@ -8,6 +8,7 @@ SERVICE_USER="${SUDO_USER:-$(id -un)}"
 VENV_DIR="${PROJECT_DIR}/.runtime-venv"
 PYTHON_BIN="${VENV_DIR}/bin/python"
 START_SCRIPT="${PROJECT_DIR}/start_rpi_app.sh"
+DIAG_SCRIPT="${PROJECT_DIR}/diagnose_rpi_autostart.sh"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 ENV_FILE="/etc/default/${SERVICE_NAME}"
 
@@ -62,6 +63,11 @@ if [[ ! -f "${START_SCRIPT}" ]]; then
   exit 1
 fi
 
+if [[ -f "${DIAG_SCRIPT}" ]]; then
+  sed -i 's/\r$//' "${DIAG_SCRIPT}"
+  chmod +x "${DIAG_SCRIPT}"
+fi
+
 echo "[1/6] Installing Raspberry Pi system packages"
 if [[ "${SKIP_APT:-0}" == "1" ]]; then
   echo "SKIP_APT=1, skipping apt packages"
@@ -73,6 +79,7 @@ else
 fi
 
 echo "[2/6] Preparing Python virtual environment"
+sed -i 's/\r$//' "${START_SCRIPT}"
 chmod +x "${START_SCRIPT}"
 sudo -u "${SERVICE_USER}" python3 -m venv "${VENV_DIR}"
 sudo -u "${SERVICE_USER}" "${PYTHON_BIN}" -m pip install --upgrade pip
@@ -104,7 +111,7 @@ WorkingDirectory=${PROJECT_DIR}
 Environment=PYTHONUNBUFFERED=1
 Environment=APP_SCRIPT=${APP_SCRIPT}
 EnvironmentFile=-${ENV_FILE}
-ExecStart=${START_SCRIPT}
+ExecStart=/bin/bash ${START_SCRIPT}
 Restart=always
 RestartSec=5
 StandardOutput=journal

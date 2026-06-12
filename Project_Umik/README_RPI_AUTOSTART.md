@@ -11,6 +11,12 @@ chmod +x install_rpi_autostart.sh
 sudo ./install_rpi_autostart.sh
 ```
 
+If the file was copied from Windows and does not start, run it through bash:
+
+```bash
+sudo bash install_rpi_autostart.sh
+```
+
 By default the service starts `main.py`. That script also starts the Flask web UI on port `5000`.
 The installer also installs typical Raspberry Pi packages: `python3-venv`, `python3-pip`, `portaudio19-dev`, `libsndfile1`, and `ffmpeg`.
 On every service start, `start_rpi_app.sh` checks the virtual environment and installs missing Python packages from `requirements.txt`, then runs `main.py`.
@@ -21,6 +27,32 @@ To start the full app manually with the same checks:
 chmod +x start_rpi_app.sh
 ./start_rpi_app.sh
 ```
+
+## Open In Terminal On Desktop Login
+
+If Raspberry Pi boots into the graphical desktop and you want to see the command window, install desktop autostart:
+
+```bash
+sudo systemctl disable --now umik
+chmod +x install_rpi_terminal_autostart.sh
+./install_rpi_terminal_autostart.sh
+```
+
+This creates:
+
+```bash
+~/.config/autostart/umik-terminal.desktop
+```
+
+It opens a terminal window through `open_rpi_terminal_app.sh` and runs `start_rpi_app.sh`, which checks Python/packages and then starts `main.py`.
+
+To disable this visible terminal autostart:
+
+```bash
+rm ~/.config/autostart/umik-terminal.desktop
+```
+
+This desktop mode starts after the user logs into the graphical Raspberry Pi desktop. For startup before login, use the `systemd` service.
 
 To start only the web UI:
 
@@ -41,6 +73,30 @@ sudo systemctl status umik
 sudo journalctl -u umik -f
 sudo systemctl restart umik
 sudo systemctl disable --now umik
+```
+
+## If autostart does not work
+
+Run diagnostics:
+
+```bash
+chmod +x diagnose_rpi_autostart.sh
+./diagnose_rpi_autostart.sh
+```
+
+The most important checks are:
+
+```bash
+systemctl is-enabled umik
+sudo systemctl status umik
+sudo journalctl -u umik -n 120 --no-pager
+```
+
+Reinstall the service after copying updated scripts:
+
+```bash
+sudo bash install_rpi_autostart.sh
+sudo systemctl restart umik
 ```
 
 ## Settings
