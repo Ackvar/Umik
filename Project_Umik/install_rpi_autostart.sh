@@ -103,6 +103,8 @@ cat > "${SERVICE_FILE}" <<SERVICE
 Description=UMIK noise monitoring app
 Wants=network-online.target
 After=network-online.target sound.target
+ConditionPathExists=${PROJECT_DIR}/${APP_SCRIPT}
+ConditionPathExists=${START_SCRIPT}
 
 [Service]
 Type=simple

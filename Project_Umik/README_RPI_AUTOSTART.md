@@ -2,6 +2,22 @@
 
 This project can be started on boot with a `systemd` service.
 
+## One Command Setup
+
+After downloading/copying the project to Raspberry Pi, run this once from the project folder:
+
+```bash
+bash setup_rpi.sh
+```
+
+This installs dependencies, creates the Python environment, enables autostart, and starts the app through `main.py`.
+
+If you want the app to open in a visible terminal window after desktop login:
+
+```bash
+bash setup_rpi.sh terminal
+```
+
 ## Install
 
 Copy the project to Raspberry Pi, open a terminal in the project folder, then run:
